@@ -1185,14 +1185,23 @@ test("macos-installers removes installers not newer than this Mac and keeps newe
   const home = await temporaryHome();
   try {
     const applications = join(home, "Applications");
-    for (const name of ["Tahoe", "Current", "Future", "Mystery"])
+    // macOS 27 puts its major in the title; its bundle name may or may not carry it.
+    for (const name of [
+      "Tahoe",
+      "Current",
+      "Future",
+      "Mystery",
+      "Golden Gate",
+      "27 Golden Gate",
+      "26 Golden Gate",
+    ])
       await mkdir(join(applications, `Install macOS ${name}.app/Contents`), {
         recursive: true,
       });
     await mkdir(join(applications, "Notes.app"));
     const { host } = fake((command) => {
       if (command.file === "softwareupdate")
-        return "Software Update found the following full installers:\n* Title: macOS Tahoe, Version: 26.7.2, Size: 1KiB, Build: 25G332, Deferred: NO\n* Title: macOS Current, Version: 27.1, Size: 1KiB, Build: 26B1, Deferred: NO\n* Title: macOS Future, Version: 28.0, Size: 1KiB, Build: 27A1, Deferred: NO\n";
+        return "Software Update found the following full installers:\n* Title: macOS 27 Golden Gate, Version: 27.2, Size: 17389792KiB, Build: 26B123, Deferred: NO\n* Title: macOS Tahoe, Version: 26.7.2, Size: 1KiB, Build: 25G332, Deferred: NO\n* Title: macOS Current, Version: 27.1, Size: 1KiB, Build: 26B1, Deferred: NO\n* Title: macOS Future, Version: 28.0, Size: 1KiB, Build: 27A1, Deferred: NO\n";
       if (command.file === "sw_vers") return "27.2\n";
       return undefined;
     });
@@ -1207,19 +1216,28 @@ test("macos-installers removes installers not newer than this Mac and keeps newe
     assert.deepEqual(
       report.items.map((item) => [item.target, item.status]).sort(),
       [
+        [join(applications, "Install macOS 27 Golden Gate.app"), "completed"],
         [join(applications, "Install macOS Current.app"), "completed"],
+        [join(applications, "Install macOS Golden Gate.app"), "completed"],
         [join(applications, "Install macOS Tahoe.app"), "completed"],
       ],
     );
     assert.deepEqual(report.tasks[0].notes.sort(), [
       `Newer than this Mac (28 > 27), kept: ${join(applications, "Install macOS Future.app")}`,
+      `Version unknown, kept: ${join(applications, "Install macOS 26 Golden Gate.app")}`,
       `Version unknown, kept: ${join(applications, "Install macOS Mystery.app")}`,
     ]);
-    for (const name of ["Install macOS Tahoe.app", "Install macOS Current.app"])
+    for (const name of [
+      "Install macOS Tahoe.app",
+      "Install macOS Current.app",
+      "Install macOS Golden Gate.app",
+      "Install macOS 27 Golden Gate.app",
+    ])
       assert.equal(await exists(join(applications, name)), false, name);
     for (const name of [
       "Install macOS Future.app",
       "Install macOS Mystery.app",
+      "Install macOS 26 Golden Gate.app",
       "Notes.app",
     ])
       assert.equal(await exists(join(applications, name)), true, name);

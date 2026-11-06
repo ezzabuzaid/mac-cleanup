@@ -35,8 +35,14 @@ export class MacOSInstallersCleanup extends CleanupTask {
       context.signal,
     );
     const majors = new Map<string, number>();
-    for (const match of listing.matchAll(/Title: (.+?), Version: (\d+)/g))
-      majors.set(match[1], Number(match[2]));
+    for (const [, title, version] of listing.matchAll(
+      /Title: (.+?), Version: (\d+)/g,
+    )) {
+      majors.set(title, Number(version));
+      // softwareupdate titles macOS 27 "macOS 27 Golden Gate" (2026-11-06). The bundle name of
+      // its installer is not verified (a 17 GB download), so the name without the number counts too.
+      majors.set(title.replace(/^macOS \d+ /, "macOS "), Number(version));
+    }
     const running = Number(
       (
         await context.host.run(
