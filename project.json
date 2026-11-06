@@ -1,0 +1,23 @@
+{
+  "name": "disk-cleanup",
+  "targets": {
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["prettier --check .", "eslint .", "tsc --noEmit"],
+        "parallel": false
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc --outDir dist --rewriteRelativeImportExtensions"
+      }
+    },
+    "test": {
+      "dependsOn": ["build"],
+      "executor": "nx:run-commands",
+      "options": { "command": "node --test dist/test/*.test.js" }
+    }
+  }
+}

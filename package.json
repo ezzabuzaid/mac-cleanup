@@ -1,0 +1,21 @@
+{
+  "name": "mac-cleanup",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "preview": "node cleanup.ts",
+    "typecheck": "nx run disk-cleanup:typecheck",
+    "test": "nx run disk-cleanup:test"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.29.0",
+    "@types/node": "24.19.2",
+    "eslint": "9.29.0",
+    "nx": "23.0.2",
+    "prettier": "3.9.5",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.63.0"
+  },
+  "description": "Learns what is safe to clean on a Mac, previews it, and removes only what you allow.",
+  "license": "MIT"
+}

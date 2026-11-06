@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/nx/schemas/nx-schema.json",
+  "useDaemonProcess": false,
+  "targetDefaults": {
+    "typecheck": { "cache": false },
+    "test": { "cache": false },
+    "build": { "cache": false }
+  }
+}
