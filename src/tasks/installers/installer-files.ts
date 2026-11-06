@@ -99,7 +99,21 @@ export class InstallerFilesCleanup extends CleanupTask {
         const type = extname(entry.name).toLowerCase();
         let reason: string;
         if (type === ".zip") {
-          const name = await InstallerFilesCleanup.#zippedApp(path, context);
+          let name: string | null;
+          try {
+            name = await InstallerFilesCleanup.#zippedApp(path, context);
+          } catch (error) {
+            // zipinfo exits 9 for a file it cannot read as an archive (junk, empty,
+            // truncated or permission denied); one such file must not stop the scan.
+            if (!(
+              error instanceof Error &&
+              "code" in error &&
+              error.code === 9
+            ))
+              throw error;
+            result.notes.push(`Unreadable archive, kept: ${path}`);
+            continue;
+          }
           const app =
             name === null
               ? undefined

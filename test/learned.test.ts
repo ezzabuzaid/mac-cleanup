@@ -1104,12 +1104,13 @@ test("installers takes a .zip only when it holds just an installed app", async (
   try {
     await installApp(home, "Hoy");
     await mkdir(join(home, "Downloads"));
-    for (const name of ["Hoy.zip", "notes.zip", "Gone.zip"])
+    for (const name of ["Hoy.zip", "notes.zip", "Gone.zip", "Mixed.zip"])
       await oldFile(join(home, "Downloads", name));
     const listings: Record<string, string> = {
       "Hoy.zip": "Hoy.app/\nHoy.app/Contents/Info.plist\n__MACOSX/._Hoy.app\n",
       "notes.zip": "notes.txt\n",
       "Gone.zip": "Gone.app/\nGone.app/Contents/Info.plist\n",
+      "Mixed.zip": "Hoy.app/\nHoy.app/Contents/Info.plist\nnotes.txt\n",
     };
     const { host } = fake((command) => {
       if (command.file === "plutil")
@@ -1138,18 +1139,60 @@ test("installers takes a .zip only when it holds just an installed app", async (
   }
 });
 
+test("installers notes an archive zipinfo cannot read and still proposes the other installers", async () => {
+  const home = await temporaryHome();
+  try {
+    await installApp(home, "Hoy");
+    await mkdir(join(home, "Downloads"));
+    await oldFile(join(home, "Downloads/broken.zip"));
+    await oldFile(join(home, "Downloads/Hoy-0-9-5.dmg"));
+    const { host } = fake((command) => {
+      if (command.file === "plutil")
+        return plist(
+          { CFBundleIdentifier: "dk.heyiam.hoy", CFBundleName: "Hoy" },
+          command,
+        );
+      // zipinfo's exit for a file that is not a readable archive (probed on macOS 27).
+      if (command.file === "zipinfo") throw exit(9);
+      return undefined;
+    });
+    const plan = await new InstallerFilesCleanup(
+      task("installers", "explicit"),
+      [join(home, "Downloads")],
+      7,
+      inventory(home),
+      new PathPolicy([home], []),
+    ).inspect(context(host, "preview", []));
+    assert.equal(plan.error, null);
+    assert.deepEqual(
+      plan.actions.map((action) => [action.view.target, action.view.reason]),
+      [
+        [
+          join(home, "Downloads/Hoy-0-9-5.dmg"),
+          "Installer; installed as Hoy.app",
+        ],
+      ],
+    );
+    assert.deepEqual(plan.notes, [
+      `Unreadable archive, kept: ${join(home, "Downloads/broken.zip")}`,
+    ]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("macos-installers removes installers not newer than this Mac and keeps newer or unknown ones", async () => {
   const home = await temporaryHome();
   try {
     const applications = join(home, "Applications");
-    for (const name of ["Tahoe", "Future", "Mystery"])
+    for (const name of ["Tahoe", "Current", "Future", "Mystery"])
       await mkdir(join(applications, `Install macOS ${name}.app/Contents`), {
         recursive: true,
       });
     await mkdir(join(applications, "Notes.app"));
     const { host } = fake((command) => {
       if (command.file === "softwareupdate")
-        return "Software Update found the following full installers:\n* Title: macOS Tahoe, Version: 26.7.2, Size: 1KiB, Build: 25G332, Deferred: NO\n* Title: macOS Future, Version: 28.0, Size: 1KiB, Build: 27A1, Deferred: NO\n";
+        return "Software Update found the following full installers:\n* Title: macOS Tahoe, Version: 26.7.2, Size: 1KiB, Build: 25G332, Deferred: NO\n* Title: macOS Current, Version: 27.1, Size: 1KiB, Build: 26B1, Deferred: NO\n* Title: macOS Future, Version: 28.0, Size: 1KiB, Build: 27A1, Deferred: NO\n";
       if (command.file === "sw_vers") return "27.2\n";
       return undefined;
     });
@@ -1162,17 +1205,18 @@ test("macos-installers removes installers not newer than this Mac and keeps newe
       () => {},
     );
     assert.deepEqual(
-      report.items.map((item) => [item.target, item.status]),
-      [[join(applications, "Install macOS Tahoe.app"), "completed"]],
+      report.items.map((item) => [item.target, item.status]).sort(),
+      [
+        [join(applications, "Install macOS Current.app"), "completed"],
+        [join(applications, "Install macOS Tahoe.app"), "completed"],
+      ],
     );
     assert.deepEqual(report.tasks[0].notes.sort(), [
       `Newer than this Mac (28 > 27), kept: ${join(applications, "Install macOS Future.app")}`,
       `Version unknown, kept: ${join(applications, "Install macOS Mystery.app")}`,
     ]);
-    assert.equal(
-      await exists(join(applications, "Install macOS Tahoe.app")),
-      false,
-    );
+    for (const name of ["Install macOS Tahoe.app", "Install macOS Current.app"])
+      assert.equal(await exists(join(applications, name)), false, name);
     for (const name of [
       "Install macOS Future.app",
       "Install macOS Mystery.app",

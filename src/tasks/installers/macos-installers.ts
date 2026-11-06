@@ -36,10 +36,7 @@ export class MacOSInstallersCleanup extends CleanupTask {
     );
     const majors = new Map<string, number>();
     for (const match of listing.matchAll(/Title: (.+?), Version: (\d+)/g))
-      majors.set(
-        match[1],
-        Math.max(majors.get(match[1]) ?? 0, Number(match[2])),
-      );
+      majors.set(match[1], Number(match[2]));
     const running = Number(
       (
         await context.host.run(
