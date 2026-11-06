@@ -15,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { gzipSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
 import type { Command, Host } from "../src/run/host.ts";
@@ -364,6 +365,45 @@ test("a CLI run writes its whole report to the --report file", async () => {
         task.notes,
       ]),
       [["duplicate-references", [`Retained original absent: ${original}`]]],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a preview prints each task's notes with --details and only their count without it", async () => {
+  const root = await temporary();
+  try {
+    const cli = join(import.meta.dirname, "../../cleanup.ts");
+    const original = join(root, "absent.gtf.gz");
+    const input = join(root, "input.json");
+    await writeFile(
+      input,
+      JSON.stringify({
+        groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }],
+      }),
+    );
+    const preview = (extra: string[]) =>
+      spawnSync(
+        process.execPath,
+        [cli, "--workflow", "duplicate-references", "--input", input, ...extra],
+        { encoding: "utf8", timeout: 60_000 },
+      );
+    const detailed = preview(["--details"]);
+    assert.equal(detailed.status, 0, detailed.stderr);
+    assert.ok(
+      detailed.stdout.includes(
+        `duplicate-references: Retained original absent: ${original}`,
+      ),
+      detailed.stdout,
+    );
+    const short = preview([]);
+    assert.equal(short.status, 0, short.stderr);
+    assert.ok(!short.stdout.includes("Retained original absent"), short.stdout);
+    // Nx forces color, so console.table wraps each value in terminal codes.
+    assert.match(
+      stripVTControlCharacters(short.stdout),
+      /'duplicate-references'.*│ 1 +│$/m,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

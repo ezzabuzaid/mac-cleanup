@@ -11,7 +11,7 @@ macOS only. Node LTS (see `.nvmrc`). No runtime dependencies.
 ```sh
 node cleanup.ts                       # preview: read-only, the default
 node cleanup.ts --list                # the tasks
-node cleanup.ts --details             # print every target
+node cleanup.ts --details             # print every target and every note
 mkdir -p reports && node cleanup.ts --report reports/preview.json
 ```
 

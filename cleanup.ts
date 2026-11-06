@@ -146,11 +146,14 @@ function printReport(report: RunReport, details: boolean) {
           : !task.configured
             ? "unconfigured"
             : "inspected",
+      notes: task.notes.length,
     })),
   );
   for (const task of report.tasks) {
     if (task.error !== null) console.error(`${task.id}: ${task.error}`);
     if (!task.configured) console.log(`${task.id}: ${task.notes.join(" ")}`);
+    else if (details)
+      for (const note of task.notes) console.log(`${task.id}: ${note}`);
   }
   for (const item of report.items) {
     if (
@@ -170,7 +173,7 @@ function printReport(report: RunReport, details: boolean) {
   }
   if (!details)
     console.log(
-      "Use --details to print every target; the JSON report always contains all targets.",
+      "Use --details to print every target and note; the JSON report always contains all of them.",
     );
   console.log(
     report.mode === "preview"
