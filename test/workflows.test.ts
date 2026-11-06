@@ -1,10 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { constants, existsSync } from "node:fs";
 import {
   mkdtemp,
   mkdir,
+  open,
   writeFile,
   readFile,
   rm,
@@ -278,6 +280,241 @@ test("the CLI refuses --workflow with --only or --select before it inspects anyt
     assert.doesNotMatch(run.stderr, /Inspecting/);
   }
 });
+
+test("the CLI refuses a --report path it cannot create before it inspects anything", async () => {
+  const root = await temporary();
+  try {
+    const cli = join(import.meta.dirname, "../../cleanup.ts");
+    const input = join(root, "input.json");
+    await writeFile(
+      input,
+      JSON.stringify({
+        groups: [
+          {
+            original: join(root, "absent.gtf.gz"),
+            copies: join(root, "*.gtf"),
+            olderThanDays: 7,
+          },
+        ],
+      }),
+    );
+    const existing = join(root, "existing.json");
+    await writeFile(existing, "keep me");
+    for (const [report, error] of [
+      [join(root, "missing/report.json"), /ENOENT/],
+      [existing, /EEXIST/],
+    ] as const) {
+      const run = spawnSync(
+        process.execPath,
+        [
+          cli,
+          "--workflow",
+          "duplicate-references",
+          "--input",
+          input,
+          "--report",
+          report,
+        ],
+        { encoding: "utf8", timeout: 60_000 },
+      );
+      assert.notEqual(run.status, 0, report);
+      assert.match(run.stderr, error, report);
+      assert.doesNotMatch(run.stderr, /Inspecting/, report);
+    }
+    assert.equal(await readFile(existing, "utf8"), "keep me");
+    assert.equal(existsSync(join(root, "missing")), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a CLI run writes its whole report to the --report file", async () => {
+  const root = await temporary();
+  try {
+    const cli = join(import.meta.dirname, "../../cleanup.ts");
+    const original = join(root, "absent.gtf.gz");
+    const input = join(root, "input.json");
+    await writeFile(
+      input,
+      JSON.stringify({
+        groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }],
+      }),
+    );
+    const report = join(root, "report.json");
+    const run = spawnSync(
+      process.execPath,
+      [
+        cli,
+        "--workflow",
+        "duplicate-references",
+        "--input",
+        input,
+        "--report",
+        report,
+      ],
+      { encoding: "utf8", timeout: 60_000 },
+    );
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stdout, new RegExp(`Report: ${report}`));
+    const written = JSON.parse(await readFile(report, "utf8"));
+    assert.equal(written.interrupted, null);
+    assert.deepEqual(
+      written.tasks.map((task: { id: string; notes: string[] }) => [
+        task.id,
+        task.notes,
+      ]),
+      [["duplicate-references", [`Retained original absent: ${original}`]]],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test(
+  "an interrupted CLI run writes its partial report and exits with the signal's code",
+  { timeout: 60_000 },
+  async () => {
+    const cli = join(import.meta.dirname, "../../cleanup.ts");
+    for (const [signal, code] of [
+      ["SIGINT", 130],
+      ["SIGTERM", 143],
+    ] as const) {
+      const root = await temporary();
+      // The workflow hashes its original during inspect. A FIFO whose write end this test
+      // holds keeps that read waiting, so the signal always lands inside the run. The write
+      // end stays open until the CLI exits: without a writer, the CLI's open of the FIFO
+      // would block for good if it came after the close.
+      const original = join(root, "original.gtf.gz");
+      assert.equal(spawnSync("mkfifo", [original]).status, 0);
+      const writer = await open(original, constants.O_RDWR);
+      try {
+        const input = join(root, "input.json");
+        await writeFile(
+          input,
+          JSON.stringify({
+            groups: [
+              { original, copies: join(root, "*.gtf"), olderThanDays: 7 },
+            ],
+          }),
+        );
+        const report = join(root, "report.json");
+        const child = spawn(
+          process.execPath,
+          [
+            cli,
+            "--workflow",
+            "duplicate-references",
+            "--input",
+            input,
+            "--report",
+            report,
+          ],
+          { timeout: 30_000, killSignal: "SIGKILL" },
+        );
+        const exited = once(child, "exit");
+        try {
+          const output = { stdout: "", stderr: "" };
+          for (const stream of ["stdout", "stderr"] as const)
+            child[stream].setEncoding("utf8").on("data", (chunk: string) => {
+              output[stream] += chunk;
+            });
+          const printed = (stream: "stdout" | "stderr", text: string) =>
+            new Promise<void>((resolve) => {
+              const check = () => {
+                if (!output[stream].includes(text)) return;
+                child[stream].off("data", check);
+                resolve();
+              };
+              child[stream].on("data", check);
+              check();
+            });
+          await printed("stderr", "Inspecting duplicate-references");
+          child.kill(signal);
+          await printed(
+            "stderr",
+            `Interrupted by ${signal}: stopping after the current step.`,
+          );
+          // Bytes that are not gzip end the hash read in whichever order the CLI reaches it.
+          await writer.write("not gzip");
+          const [exitCode] = await exited;
+          assert.equal(exitCode, code, output.stderr);
+          assert.doesNotMatch(output.stderr, /\n\s+at |Node\.js v/);
+          assert.match(output.stdout, new RegExp(`Report: ${report}`));
+          const written = JSON.parse(await readFile(report, "utf8"));
+          assert.equal(written.interrupted, `Interrupted by ${signal}`);
+          assert.deepEqual([written.tasks, written.items], [[], []]);
+        } finally {
+          if (child.exitCode === null) child.kill("SIGKILL");
+        }
+      } finally {
+        await writer.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  },
+);
+
+test(
+  "a second signal stops an interrupted CLI run at once",
+  { timeout: 60_000 },
+  async () => {
+    const cli = join(import.meta.dirname, "../../cleanup.ts");
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      const root = await temporary();
+      // This test never writes to the FIFO, so the workflow's hash read waits until the
+      // process ends: only the second signal can end the run.
+      const original = join(root, "original.gtf.gz");
+      assert.equal(spawnSync("mkfifo", [original]).status, 0);
+      const writer = await open(original, constants.O_RDWR);
+      try {
+        const input = join(root, "input.json");
+        await writeFile(
+          input,
+          JSON.stringify({
+            groups: [
+              { original, copies: join(root, "*.gtf"), olderThanDays: 7 },
+            ],
+          }),
+        );
+        const child = spawn(
+          process.execPath,
+          [cli, "--workflow", "duplicate-references", "--input", input],
+          { timeout: 30_000, killSignal: "SIGKILL" },
+        );
+        const exited = once(child, "exit");
+        try {
+          let stderr = "";
+          child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+            stderr += chunk;
+          });
+          const printed = (text: string) =>
+            new Promise<void>((resolve) => {
+              const check = () => {
+                if (!stderr.includes(text)) return;
+                child.stderr.off("data", check);
+                resolve();
+              };
+              child.stderr.on("data", check);
+              check();
+            });
+          await printed("Inspecting duplicate-references");
+          child.kill(signal);
+          await printed(
+            `Interrupted by ${signal}: stopping after the current step.`,
+          );
+          child.kill(signal);
+          assert.deepEqual(await exited, [null, signal]);
+        } finally {
+          if (child.exitCode === null && child.signalCode === null)
+            child.kill("SIGKILL");
+        }
+      } finally {
+        await writer.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  },
+);
 
 test("docker-offload refuses a destination that is not an SSH context", async () => {
   const { host, calls } = fake((command) =>

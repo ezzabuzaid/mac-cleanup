@@ -236,6 +236,151 @@ test("command discovery failures remain errors and later tasks still inspect", a
   }
 });
 
+test("an interrupted run keeps the actions it completed and starts no later task", async () => {
+  const { root, policy } = await fixture();
+  try {
+    const names = ["done", "cut", "later"];
+    for (const name of names) {
+      await writeFile(join(root, name), "x");
+      await old(join(root, name));
+    }
+    const tasks = names.map(
+      (name) =>
+        new SelectedPathsCleanup(
+          { ...routine, id: name },
+          [
+            {
+              path: join(root, name),
+              select: "self",
+              olderThanDays: 7,
+              reason: "fixture",
+            },
+          ],
+          policy,
+        ),
+    );
+    const { host: answers } = fake(() => undefined);
+    const { promise: blocked, resolve: block } = Promise.withResolvers<void>();
+    const host: Host = {
+      run(command, signal) {
+        if (command.file !== "du" || command.args.at(-1) !== join(root, "cut"))
+          return answers.run(command, signal);
+        block();
+        return new Promise((_, reject) =>
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          }),
+        );
+      },
+    };
+    const controller = new AbortController();
+    const progress: string[] = [];
+    const running = new CleanupRun(tasks, root).run(
+      { ...context(host, "apply", []), signal: controller.signal },
+      (message) => progress.push(message),
+    );
+    await blocked;
+    controller.abort(new Error("Interrupted by SIGINT"));
+    const report = await running;
+    assert.equal(report.interrupted, "Interrupted by SIGINT");
+    assert.deepEqual(
+      report.items.map((item) => [item.target, item.status]),
+      [[join(root, "done"), "completed"]],
+    );
+    assert.deepEqual(
+      report.tasks.map((task) => task.id),
+      ["done"],
+    );
+    assert.deepEqual(progress, ["Inspecting done", "Inspecting cut"]);
+    assert.equal(await exists(join(root, "done")), false);
+    assert.equal(await exists(join(root, "cut")), true);
+    assert.equal(await exists(join(root, "later")), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an abort during an action marks it interrupted and leaves the later actions planned", async () => {
+  const { root, policy } = await fixture();
+  try {
+    const folder = join(root, "downloads");
+    await mkdir(folder);
+    for (const name of ["a", "b", "c"]) {
+      await writeFile(join(folder, name), "x");
+      await old(join(folder, name));
+    }
+    const later = join(root, "later");
+    await writeFile(later, "x");
+    await old(later);
+    const tasks = [
+      new SelectedPathsCleanup(
+        routine,
+        [
+          {
+            path: folder,
+            select: "children",
+            olderThanDays: 7,
+            reason: "fixture",
+          },
+        ],
+        policy,
+      ),
+      new SelectedPathsCleanup(
+        { ...routine, id: "later" },
+        [{ path: later, select: "self", olderThanDays: 7, reason: "fixture" }],
+        policy,
+      ),
+    ];
+    const { host: answers } = fake(() => undefined);
+    const { promise: blocked, resolve: block } = Promise.withResolvers<void>();
+    let openFileChecks = 0;
+    const host: Host = {
+      run(command, signal) {
+        if (command.file !== "lsof" || ++openFileChecks !== 2)
+          return answers.run(command, signal);
+        block();
+        return new Promise((_, reject) =>
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          }),
+        );
+      },
+    };
+    const controller = new AbortController();
+    const progress: string[] = [];
+    const running = new CleanupRun(tasks, root).run(
+      { ...context(host, "apply", []), signal: controller.signal },
+      (message) => progress.push(message),
+    );
+    await blocked;
+    controller.abort(new Error("Interrupted by SIGTERM"));
+    const report = await running;
+    assert.equal(report.interrupted, "Interrupted by SIGTERM");
+    assert.deepEqual(
+      report.items.map((item) => [item.status, item.detail]),
+      [
+        ["completed", ""],
+        ["interrupted", "Interrupted by SIGTERM"],
+        ["planned", ""],
+      ],
+    );
+    for (const item of report.items)
+      assert.equal(
+        await exists(item.target),
+        item.status !== "completed",
+        item.target,
+      );
+    assert.deepEqual(progress, [`Inspecting ${routine.id}`]);
+    assert.deepEqual(
+      report.tasks.map((task) => task.id),
+      [routine.id],
+    );
+    assert.equal(await exists(later), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("npm uses its native cache command and preserves npx contents", async () => {
   const { root, policy } = await fixture();
   try {

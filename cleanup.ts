@@ -1,5 +1,6 @@
 import { parseArgs } from "node:util";
-import { readFile, writeFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
+import { constants } from "node:os";
 import { isAbsolute } from "node:path";
 import { cleanup } from "./profile.ts";
 import { LocalHost } from "./src/run/host.ts";
@@ -84,8 +85,19 @@ Every task learns its targets from this machine. No shell commands are evaluated
             process.env,
           ),
         ];
+  // Exclusive creation before any task runs: a report never overwrites a user file, and a
+  // path that cannot be created fails before anything is removed.
+  const output =
+    values.report === undefined ? undefined : await open(values.report, "wx");
   const controller = new AbortController();
-  const interrupt = () => controller.abort(new Error("Interrupted"));
+  // once: the second signal gets Node's default handling and stops the process at once.
+  const interrupt = (signal: NodeJS.Signals) => {
+    process.exitCode = 128 + constants.signals[signal];
+    controller.abort(new Error(`Interrupted by ${signal}`));
+    console.error(
+      `Interrupted by ${signal}: stopping after the current step. A second ${signal} stops at once.`,
+    );
+  };
   process.once("SIGINT", interrupt);
   process.once("SIGTERM", interrupt);
   try {
@@ -102,19 +114,18 @@ Every task learns its targets from this machine. No shell commands are evaluated
       (message) => console.error(message),
     );
     printReport(report, values.details === true);
-    if (values.report !== undefined) {
-      // Exclusive creation: a report can never overwrite an existing user file.
-      await writeFile(values.report, `${JSON.stringify(report, null, 2)}\n`, {
-        flag: "wx",
-      });
+    if (output !== undefined) {
+      await output.writeFile(`${JSON.stringify(report, null, 2)}\n`);
       console.log(`Report: ${values.report}`);
     }
     if (
-      report.tasks.some((task) => task.error !== null) ||
-      report.items.some((item) => item.status === "failed")
+      report.interrupted === null &&
+      (report.tasks.some((task) => task.error !== null) ||
+        report.items.some((item) => item.status === "failed"))
     )
       process.exitCode = 1;
   } finally {
+    await output?.close();
     process.removeListener("SIGINT", interrupt);
     process.removeListener("SIGTERM", interrupt);
   }
@@ -122,7 +133,7 @@ Every task learns its targets from this machine. No shell commands are evaluated
 
 function printReport(report: RunReport, details: boolean) {
   console.log(
-    `\n${report.mode.toUpperCase()}: ${report.items.length} actions across ${report.tasks.length} tasks`,
+    `\n${report.mode.toUpperCase()}${report.interrupted === null ? "" : ` (${report.interrupted})`}: ${report.items.length} actions across ${report.tasks.length} tasks`,
   );
   console.table(
     report.tasks.map((task) => ({
@@ -142,7 +153,12 @@ function printReport(report: RunReport, details: boolean) {
     if (!task.configured) console.log(`${task.id}: ${task.notes.join(" ")}`);
   }
   for (const item of report.items) {
-    if (!details && item.status !== "failed" && item.status !== "skipped")
+    if (
+      !details &&
+      item.status !== "failed" &&
+      item.status !== "skipped" &&
+      item.status !== "interrupted"
+    )
       continue;
     const size =
       item.estimatedBytes === null
