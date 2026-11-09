@@ -3,10 +3,13 @@ import { isAbsolute, join, parse, relative, resolve } from "node:path";
 import { exists, within } from "./within.ts";
 import { Ineligible } from "../run/action.ts";
 import { type Context } from "../run/context.ts";
+import { type Command } from "../run/host.ts";
+
+/** Compared by identity: CleanupRun shares one answer to this command during inspection. */
+export const openFilesCommand: Command = { file: "lsof", args: ["-nP", "-Fn"] };
 
 /** Shared live path constraints. No recursive delete implementation is owned here. */
 export class PathPolicy {
-  private readonly previewOpenFiles = new WeakMap<Context, Promise<string[]>>();
   readonly protectedPaths: readonly string[];
   readonly ownedRoots: readonly string[];
   constructor(
@@ -58,26 +61,10 @@ export class PathPolicy {
       throw new Ineligible(`Symlink in path: ${path}`);
   }
   async assertUnused(path: string, context: Context): Promise<void> {
-    const read = async () =>
-      (
-        await context.host.run(
-          { file: "lsof", args: ["-nP", "-Fn"] },
-          context.signal,
-        )
-      )
-        .split("\n")
-        .filter((line) => line.startsWith("n/"))
-        .map((line) => line.slice(1));
-    let pending =
-      context.mode === "preview"
-        ? this.previewOpenFiles.get(context)
-        : undefined;
-    if (pending === undefined) {
-      pending = read();
-      if (context.mode === "preview")
-        this.previewOpenFiles.set(context, pending);
-    }
-    const used = await pending;
+    const used = (await context.host.run(openFilesCommand, context.signal))
+      .split("\n")
+      .filter((line) => line.startsWith("n/"))
+      .map((line) => line.slice(1));
     const canonical = await realpath(path);
     if (used.some((file) => within(canonical, file)))
       throw new Ineligible(`Open files: ${path}`);

@@ -1,8 +1,10 @@
 import { statfs } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { openFilesCommand } from "../paths/policy.ts";
 import { within } from "../paths/within.ts";
 import { type ActionView, Ineligible } from "./action.ts";
 import { type Context, type Mode } from "./context.ts";
+import { SnapshotHost } from "./host.ts";
 import { CleanupTask, type TaskIdentity, type TaskPlan } from "./task.ts";
 
 export interface ItemReport extends ActionView {
@@ -57,12 +59,18 @@ export class CleanupRun {
       tasks: [],
       items: [],
     };
+    // A guard runs per candidate, also in inspection, and lsof takes most of a second. Inspection
+    // only plans, so it shares one answer. An action gets `context`, so each check there reads again.
+    const inspection: Context = {
+      ...context,
+      host: new SnapshotHost(context.host, openFilesCommand),
+    };
     for (const task of this.tasks) {
       if (context.signal.aborted) break;
       progress(`Inspecting ${task.identity.id}`);
       let plan: TaskPlan;
       try {
-        plan = await task.inspect(context);
+        plan = await task.inspect(inspection);
       } catch (error) {
         // inspect rethrows the abort reason; any other error escaping it is a defect.
         if (context.signal.aborted) break;

@@ -243,3 +243,15 @@ The protected-path entries for Codex and Dia were removed: the Codex and Dia fol
 **Lockfile:** the new dev dependency `@sinonjs/fake-timers` also brought the lockfile up to `package.json` (name, license, no `engines`).
 
 **Proof:** a claim comparator checked the claims before the first test, and a test review ran after. The review found invented `ps` lines, so each line in the uv and pip tests now comes from a real process, and the two regexes match only the captured forms. The prover found that a real `npm install` of another session failed the real-`ps` test, so that test now reads only the line of its own child. The mutation prover caught 12 of 12 mutations, and then 8 of 8 on the changed tests. The wiring of `Heartbeat` in `cleanup.ts` has only the live check, because a suite test would wait 30 s. Full suite: 73 tests pass, and typecheck passes.
+
+## 2026-11-09: inspection reads the open files once per run (#4069)
+
+**Problem:** an apply pass took 439 s, and a preview took 70 s. A guard runs for each candidate, also during inspection. `PathPolicy.assertUnused` kept one `lsof` answer only in preview, so apply ran `lsof` for each check. One `lsof` takes about 0.8 s.
+
+**Fix:** `CleanupRun` gives inspection a `SnapshotHost`, which keeps one `lsof` answer for the run. An action gets the plain context, so each check in an action runs `lsof` again. `assertUnused` no longer reads the mode. A memo per action was rejected: `sqlite-relocation` checks the source again after its copy, and a memo per action gives that check an old answer.
+
+**Effect:** inspection can use an old answer. An old answer only changes what is planned, and each removal still reads `lsof` first. A failed `lsof` stays failed for the rest of the inspection, as it did in preview: the tasks report an error and nothing is removed.
+
+**Counts:** a fixture with 2 tasks and 3 candidates ran 6 `lsof` in apply before the fix, and it runs 1 now. A read-only preview of this Mac ran 1 `lsof` before and after, for 797 open-file checks. Before the fix, each of those 797 checks ran its own `lsof` in apply. No apply pass was made, so the time of an apply pass after the fix is not measured.
+
+**Proof:** a test review ran after the tests. No guard keeps the inspection context for later. The mutation prover caught each mutation on the path of its test: actions that get the snapshot, a snapshot of every command, a snapshot per task, no snapshot, and a memo per context. The review also found that the open-file check in `RemovePathAction` is not needed for the new test to pass, because the guard of `builds` checks too; the older test "changed files and open files are rechecked" covers that line. Full suite: 75 tests pass, and typecheck passes.

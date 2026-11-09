@@ -730,6 +730,98 @@ test("build-cache cleanup binds the local builder and rejects remote/mixed endpo
   );
 });
 
+/** A git project whose ignored dist folder is a builds candidate, old enough to remove. */
+async function oldProjectWithBuild(project: string) {
+  const dist = join(project, "dist");
+  await mkdir(dist, { recursive: true });
+  await mkdir(join(project, ".git"));
+  await writeFile(join(dist, "bundle.js"), "x");
+  await old(join(dist, "bundle.js"));
+  await old(dist);
+  await old(project);
+  return dist;
+}
+
+function buildsTask(id: string, root: string, policy: PathPolicy) {
+  return new ProjectArtifactsCleanup(
+    { ...routine, id },
+    new MachineInventory({
+      home: root,
+      applicationDirs: [],
+      pathDirs: [],
+      env: {},
+    }),
+    "builds",
+    7,
+    policy,
+  );
+}
+
+test("inspection reads the open files once per run, in apply as in preview, across tasks and candidates", async () => {
+  for (const mode of ["preview", "apply"] as const) {
+    const { root, policy } = await fixture();
+    try {
+      await oldProjectWithBuild(join(root, "a"));
+      await oldProjectWithBuild(join(root, "b"));
+      await oldProjectWithBuild(join(root, "c"));
+      const { host, calls } = fake((command) => {
+        if (command.file !== "git") return undefined;
+        if (command.args.includes("rev-parse")) return command.args[1];
+        // Uncommitted work: each candidate passes its open-file check, and no action follows.
+        if (command.args.includes("status")) return " M file";
+        return "";
+      });
+      const report = await new CleanupRun(
+        [buildsTask("first", root, policy), buildsTask("second", root, policy)],
+        root,
+      ).run(context(host, mode, []), () => {});
+      assert.deepEqual(
+        report.tasks.map((task) => task.notes.length),
+        [3, 3],
+        mode,
+      );
+      assert.equal(report.items.length, 0, mode);
+      assert.equal(calls.filter((c) => c.file === "lsof").length, 1, mode);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a path opened after inspection is kept, because each action reads the open files again", async () => {
+  const { root, policy } = await fixture();
+  try {
+    const first = await oldProjectWithBuild(join(root, "a"));
+    const second = await oldProjectWithBuild(join(root, "b"));
+    const { host } = fake(async (command) => {
+      if (command.file === "lsof")
+        return (await exists(first))
+          ? ""
+          : `p123\nn${join(second, "bundle.js")}\n`;
+      if (command.file !== "git") return undefined;
+      if (command.args.includes("rev-parse")) return command.args[1];
+      if (command.args.includes("log")) return "1";
+      return "";
+    });
+    const report = await new CleanupRun(
+      [buildsTask("builds", root, policy)],
+      root,
+    ).run(context(host, "apply", []), () => {});
+    assert.deepEqual(
+      report.items.map((item) => [item.target, item.status]),
+      [
+        [first, "completed"],
+        [second, "skipped"],
+      ],
+    );
+    assert.match(report.items[1].detail, /Open files/);
+    assert.equal(await exists(first), false);
+    assert.equal(await readFile(join(second, "bundle.js"), "utf8"), "x");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("recent sibling activity protects nested monorepo dependencies", async () => {
   const { root, policy } = await fixture();
   try {
