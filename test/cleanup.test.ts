@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { createClock } from "@sinonjs/fake-timers";
 import {
   mkdtemp,
   mkdir,
@@ -20,6 +23,7 @@ import { exists } from "../src/paths/within.ts";
 import { Ineligible } from "../src/run/action.ts";
 import { type Context } from "../src/run/context.ts";
 import { type Command, type Host, LocalHost } from "../src/run/host.ts";
+import { Heartbeat } from "../src/run/heartbeat.ts";
 import { CleanupRun } from "../src/run/run.ts";
 import { type TaskIdentity } from "../src/run/task.ts";
 import { DockerCleanup } from "../src/tasks/docker/docker-cleanup.ts";
@@ -27,7 +31,10 @@ import { ChromeClonesCleanup } from "../src/tasks/macos/chrome-clones.ts";
 import { RestartCleanup } from "../src/tasks/macos/restart.ts";
 import { SimulatorRuntimesCleanup } from "../src/tasks/macos/simulators.ts";
 import { ObsoleteAppUpdatesCleanup } from "../src/tasks/macos/staged-updates.ts";
-import { PackageCacheCleanup } from "../src/tasks/packages/package-cache.ts";
+import {
+  PackageCacheCleanup,
+  type PackageManager,
+} from "../src/tasks/packages/package-cache.ts";
 import { ProjectArtifactsCleanup } from "../src/tasks/projects/project-artifacts.ts";
 import { SelectedPathsCleanup } from "../src/tasks/selected/selected-paths.ts";
 
@@ -400,6 +407,7 @@ test("npm uses its native cache command and preserves npx contents", async () =>
         await rm(join(cache, "_cacache"), { recursive: true });
         return "";
       }
+      if (command.file === "ps") return "";
     });
     const task = new PackageCacheCleanup(routine, "npm", cache, policy);
     const plan = await task.inspect(context(host, "preview", []));
@@ -412,6 +420,192 @@ test("npm uses its native cache command and preserves npx contents", async () =>
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("the npm task skips, with a note, while a real process titled npm install runs", async () => {
+  const { root, policy } = await fixture();
+  // npm sets its own process.title; this is that mechanism, without a registry.
+  const install = spawn(
+    process.execPath,
+    [
+      "-e",
+      'process.title = "npm install"; console.log("ready"); setInterval(() => {}, 1000)',
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  try {
+    await once(install.stdout, "data");
+    const cache = join(root, "npm");
+    await mkdir(join(cache, "_cacache"), { recursive: true });
+    const real = new LocalHost(60_000);
+    // Only this child's line: another session's real install must not answer for it.
+    const { host, calls } = fake(async (command) =>
+      command.file === "ps"
+        ? (await real.run(command, new AbortController().signal))
+            .split("\n")
+            .filter((line) => line.trim().startsWith(`${install.pid} `))
+            .join("\n")
+        : undefined,
+    );
+    const report = await new CleanupRun(
+      [new PackageCacheCleanup(routine, "npm", cache, policy)],
+      root,
+    ).run(context(host, "apply", []), () => {});
+    assert.equal(report.items[0].status, "skipped");
+    assert.match(report.items[0].detail, /npm/);
+    assert.match(report.items[0].detail, new RegExp(`pid ${install.pid}\\b`));
+    assert.equal(
+      calls.some((c) => c.file === "npm"),
+      false,
+    );
+  } finally {
+    install.kill();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Applies one package-cache task against a stubbed process list, in a temp root. */
+async function applyCacheTask(manager: PackageManager, processes: string) {
+  const { root, policy } = await fixture();
+  try {
+    const cache = join(root, manager);
+    await mkdir(join(cache, "_cacache"), { recursive: true });
+    const { host, calls } = fake((command) => {
+      if (command.file === "ps") return processes;
+      if (command.file === manager || command.file === "pip3") return "";
+    });
+    const report = await new CleanupRun(
+      [new PackageCacheCleanup(routine, manager, cache, policy)],
+      root,
+    ).run(context(host, "apply", []), () => {});
+    return {
+      status: report.items[0].status,
+      detail: report.items[0].detail,
+      cleaned: calls.some((c) => c.file === manager || c.file === "pip3"),
+    };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("the npm task skips while npm ci or npm i runs, whatever the process list holds around it", async () => {
+  for (const line of ["  812 npm ci     ", "  812 npm i left-pad    "]) {
+    const result = await applyCacheTask(
+      "npm",
+      `    1 /sbin/launchd\n${line}\n  900 npm exec @playwright/mcp@latest  \n`,
+    );
+    assert.equal(result.status, "skipped", line);
+    assert.match(result.detail, /pid 812\b/, line);
+    assert.equal(result.cleaned, false, line);
+  }
+});
+
+test("long-lived npm exec and npm run processes do not hold the npm task back", async () => {
+  const result = await applyCacheTask(
+    "npm",
+    [
+      "  900 npm exec @playwright/mcp@latest  ",
+      "  901 npm exec playwright install chromium    ",
+      "  902 npm run test   ",
+      "  903 /bin/zsh -c npm install && npm test",
+    ].join("\n"),
+  );
+  assert.deepEqual(result, { status: "completed", detail: "", cleaned: true });
+});
+
+test("the uv task skips while uv runs, also as uvx, and another manager's install does not hold it back", async () => {
+  for (const line of [
+    "  812 uv pip compile - --index-url http://127.0.0.1:57035/simple",
+    "  812 /Users/me/.local/bin/uv pip compile - --index-url http://127.0.0.1:57035/simple",
+    "  812 /Users/me/.local/bin/uv tool uvx --index-url http://127.0.0.1:57035/simple left-pad",
+  ]) {
+    const result = await applyCacheTask("uv", `${line}\n`);
+    assert.equal(result.status, "skipped", line);
+    assert.match(result.detail, /uv/, line);
+    assert.match(result.detail, /pid 812\b/, line);
+    assert.equal(result.cleaned, false, line);
+  }
+  assert.deepEqual(
+    await applyCacheTask(
+      "uv",
+      "  900 npm install left-pad    \n  901 /bin/zsh -c uv sync\n",
+    ),
+    { status: "completed", detail: "", cleaned: true },
+  );
+});
+
+test("the pip task skips while pip runs, and another manager's install does not hold it back", async () => {
+  for (const line of [
+    "  812 /opt/homebrew/Cellar/python@3.14/3.14.4_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /opt/homebrew/bin/pip3 download --no-deps left-pad",
+    "  812 /opt/homebrew/Cellar/python@3.14/3.14.4_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -m pip download --no-deps left-pad",
+    "  812 /Users/me/.local/share/uv/python/cpython-3.10.16-macos-aarch64-none/bin/python3 -m pip download --no-deps left-pad",
+  ]) {
+    const result = await applyCacheTask("pip", `${line}\n`);
+    assert.equal(result.status, "skipped", line);
+    assert.match(result.detail, /pip/, line);
+    assert.match(result.detail, /pid 812\b/, line);
+    assert.equal(result.cleaned, false, line);
+  }
+  assert.deepEqual(
+    await applyCacheTask(
+      "pip",
+      "  900 npm install left-pad    \n  901 python3.14 server.py\n",
+    ),
+    { status: "completed", detail: "", cleaned: true },
+  );
+});
+
+test("a process list that cannot be read fails the action and leaves the cache alone", async () => {
+  const { root, policy } = await fixture();
+  try {
+    const cache = join(root, "npm");
+    await mkdir(join(cache, "_cacache"), { recursive: true });
+    const { host, calls } = fake((command) => {
+      if (command.file === "ps") throw new Error("ps refused");
+    });
+    const report = await new CleanupRun(
+      [new PackageCacheCleanup(routine, "npm", cache, policy)],
+      root,
+    ).run(context(host, "apply", []), () => {});
+    assert.equal(report.items[0].status, "failed");
+    assert.match(report.items[0].detail, /ps refused/);
+    assert.equal(
+      calls.some((c) => c.file === "npm"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a silent step prints a heartbeat that names it, a new step restarts the silence, and dispose ends it", async () => {
+  const clock = createClock();
+  const lines: string[] = [];
+  const heartbeat = new Heartbeat((line) => lines.push(line), 30_000, clock);
+  heartbeat.step("Inspecting builds");
+  assert.deepEqual(lines, ["Inspecting builds"]);
+  clock.tick(29_999);
+  assert.deepEqual(lines, ["Inspecting builds"]);
+  clock.tick(30_001);
+  assert.deepEqual(lines, [
+    "Inspecting builds",
+    "Still running after 30 s; last step: Inspecting builds",
+    "Still running after 60 s; last step: Inspecting builds",
+  ]);
+  clock.tick(29_000);
+  heartbeat.step("Inspecting app-caches");
+  clock.tick(29_000);
+  assert.equal(lines.at(-1), "Inspecting app-caches");
+  clock.tick(1_000);
+  assert.equal(
+    lines.at(-1),
+    "Still running after 30 s; last step: Inspecting app-caches",
+  );
+  const printed = lines.length;
+  heartbeat[Symbol.dispose]();
+  clock.tick(120_000);
+  assert.equal(lines.length, printed);
+  assert.equal(clock.countTimers(), 0);
 });
 
 test("Docker excludes referenced/local-only images and never forces image removal", async () => {

@@ -227,3 +227,19 @@ The protected-path entries for Codex and Dia were removed: the Codex and Dia fol
 **Test trap:** Nx forces color, so a CLI that a test spawns wraps the cells of `console.table` in terminal codes. A test filtered by hand passed, and the same test failed in the test target. The test now strips the codes with `stripVTControlCharacters`.
 
 **Proof:** a claim comparator checked the claims before the first test, and a test review ran after. The mutation prover caught 6 of 6 mutations. After two changes (a simpler title alias, the stripped count), it caught 3 of 3 and 3 of 3 again, the second round with color forced as in Nx. Full suite: 66 tests pass, and typecheck passes.
+
+## 2026-11-09: a package cache is not cleaned while its manager runs, and a silent step prints a heartbeat (#4061)
+
+**Skip (npm, uv, pip):** on 2026-11-08 an apply pass emptied `~/.npm/_cacache` while `npm install` ran, and the install failed with ENOENT. The open-file check did not see the install, because a process holds no cache file open between two downloads. `PackageCacheCleanup` now reads `ps -axo pid=,args=` as the last check before the clean. A matching process makes the item `skipped`, and its detail gives the manager and the process ID. If `ps` fails, the item fails and the cache stays. The check runs only in apply, immediately before the clean. A process that starts after the check is not detected.
+
+**What each manager shows in `ps` (captured on this Mac):** npm replaces its title with `npm <positional args>`, so flags do not show (`npm/lib/npm.js`). `uvx` shows as `uv tool uvx`. The pip script shows behind its Python interpreter, which is `Python` in a framework build and `python3` in a uv build. On this Mac 59 `npm exec` processes ran at the time of the check, and most are MCP servers. So `npm exec` does not stop the npm task, and `npm exec playwright install chromium` does not match either. Any running `uv` stops the uv task, because `uv tool uvx` keeps its environment in the cache.
+
+**Other tasks:** the shared place holds npm, uv and pip only. No task cleans a pnpm, yarn, bun or cargo cache. `brew-downloads` removes only archives older than one day, with the open-file check. `brew-maintenance` is explicit. So no other task got this check.
+
+**Heartbeat:** the report of the pass took 439 s, and a preview with the same candidates took 70 s. The silence is inside task inspection: `builds` has 0 actions and 611 notes. A line per action would print nothing there. So `Heartbeat` wraps the progress lines in the CLI. When no step line comes for 30 s, it prints the last step. It takes the clock as an input. The cost of the pass itself is #4069.
+
+**Live check:** a read-only preview of `npm`, with a stub `npm` on the child `PATH` that waits 35 s, printed `Still running after 30 s; last step: Inspecting npm`. A read-only preview of `npm,uv,pip` with the real tools still plans its 2 actions. No apply run was made, so the skip is proved only by tests on fixtures.
+
+**Lockfile:** the new dev dependency `@sinonjs/fake-timers` also brought the lockfile up to `package.json` (name, license, no `engines`).
+
+**Proof:** a claim comparator checked the claims before the first test, and a test review ran after. The review found invented `ps` lines, so each line in the uv and pip tests now comes from a real process, and the two regexes match only the captured forms. The prover found that a real `npm install` of another session failed the real-`ps` test, so that test now reads only the line of its own child. The mutation prover caught 12 of 12 mutations, and then 8 of 8 on the changed tests. The wiring of `Heartbeat` in `cleanup.ts` has only the live check, because a suite test would wait 30 s. Full suite: 73 tests pass, and typecheck passes.

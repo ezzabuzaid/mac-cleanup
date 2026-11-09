@@ -3,6 +3,7 @@ import { open, readFile } from "node:fs/promises";
 import { constants } from "node:os";
 import { isAbsolute } from "node:path";
 import { cleanup } from "./profile.ts";
+import { Heartbeat } from "./src/run/heartbeat.ts";
 import { LocalHost } from "./src/run/host.ts";
 import { CleanupRun, type RunReport } from "./src/run/run.ts";
 import { workflows } from "./workflows/index.ts";
@@ -101,6 +102,11 @@ Every task learns its targets from this machine. No shell commands are evaluated
   process.once("SIGINT", interrupt);
   process.once("SIGTERM", interrupt);
   try {
+    using heartbeat = new Heartbeat(
+      (line) => console.error(line),
+      30_000,
+      globalThis,
+    );
     const run = new CleanupRun(tasks, cleanup.volume);
     const report = await run.run(
       {
@@ -111,7 +117,7 @@ Every task learns its targets from this machine. No shell commands are evaluated
         kept,
         selected,
       },
-      (message) => console.error(message),
+      (message) => heartbeat.step(message),
     );
     printReport(report, values.details === true);
     if (output !== undefined) {

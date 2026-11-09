@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { PathPolicy } from "../../paths/policy.ts";
 import { allocatedBytes } from "../../paths/remove.ts";
 import { exists } from "../../paths/within.ts";
-import { CommandAction } from "../../run/action.ts";
+import { CommandAction, Ineligible } from "../../run/action.ts";
 import { type Context } from "../../run/context.ts";
 import {
   CleanupTask,
@@ -12,6 +12,20 @@ import {
 } from "../../run/task.ts";
 
 export type PackageManager = "npm" | "uv" | "pip";
+
+/**
+ * Lines of `ps -axo pid=,args=` for a process that reads this manager's cache. An open-file
+ * check misses them: between two downloads such a process holds no cache file open.
+ * npm sets its title to `npm <positional args>` (npm/lib/npm.js), so the command comes first.
+ * `uvx` shows as `uv tool uvx`, and the pip script shows behind its Python interpreter.
+ * `npm exec` is left out: it stays alive for as long as the tool it starts, such as an MCP
+ * server, and would hold the npm cache back for good.
+ */
+const cacheReaders: Record<PackageManager, RegExp> = {
+  npm: /^ *(\d+) npm (?:install|i|add|ci|clean-install|install-test|it|install-ci-test|cit|update|up|upgrade)(?: |$)/m,
+  uv: /^ *(\d+) (?:\S*\/)?uv(?: |$)/m,
+  pip: /^ *(\d+) (?:\S*\/)?[Pp]ython[\d.]* (?:-m pip|\S*\/pip[\d.]*)(?: |$)/m,
+};
 
 /** One class composes the three native package-manager protocols. */
 export class PackageCacheCleanup extends CleanupTask {
@@ -72,6 +86,16 @@ export class PackageCacheCleanup extends CleanupTask {
       async (ctx) => {
         await this.policy.validate(target);
         await this.policy.assertUnused(target, ctx);
+        const reader = cacheReaders[this.manager].exec(
+          await ctx.host.run(
+            { file: "ps", args: ["-axo", "pid=,args="] },
+            ctx.signal,
+          ),
+        );
+        if (reader !== null)
+          throw new Ineligible(
+            `${this.manager} is running and reads this cache (pid ${reader[1]})`,
+          );
       },
       async () => {
         if (preserveNpx && !(await exists(npx)))
