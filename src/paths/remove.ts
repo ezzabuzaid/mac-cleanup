@@ -18,6 +18,32 @@ export async function allocatedBytes(
   return Number(match[1]) * 1024;
 }
 
+/** The target itself is gone: a file-system call on it failed with ENOENT, or du could not find it. */
+function vanished(error: unknown, path: string): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  if (error.code === "ENOENT") return "path" in error && error.path === path;
+  return (
+    error.code === 1 &&
+    "stderr" in error &&
+    typeof error.stderr === "string" &&
+    error.stderr.includes(`du: ${path}: No such file or directory`)
+  );
+}
+
+/** EAFP: a target that vanished between discovery and this step is already gone, not a failure. */
+async function unlessVanished<T>(
+  path: string,
+  step: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await step();
+  } catch (error) {
+    if (vanished(error, path))
+      throw new Ineligible(`Already absent: ${path}`, { cause: error });
+    throw error;
+  }
+}
+
 export class RemovePathAction extends CleanupAction {
   readonly path: string;
   readonly policy: PathPolicy;
@@ -37,17 +63,17 @@ export class RemovePathAction extends CleanupAction {
     this.observed = observed;
     this.guard = guard;
   }
-  protected async check(context: Context) {
-    if (!(await exists(this.path)))
-      throw new Ineligible(`Already absent: ${this.path}`);
-    await this.policy.validate(this.path);
-    await this.policy.assertUnused(this.path, context);
-    await this.guard(context);
-    if (!sameIdentity(this.observed, await identity(this.path)))
-      throw new Ineligible(`Changed since inspection: ${this.path}`);
+  protected check(context: Context) {
+    return unlessVanished(this.path, async () => {
+      await this.policy.validate(this.path);
+      await this.policy.assertUnused(this.path, context);
+      await this.guard(context);
+      if (!sameIdentity(this.observed, await identity(this.path)))
+        throw new Ineligible(`Changed since inspection: ${this.path}`);
+    });
   }
-  protected async perform() {
-    await rm(this.path, { recursive: true });
+  protected perform() {
+    return unlessVanished(this.path, () => rm(this.path, { recursive: true }));
   }
   protected async verify() {
     if (await exists(this.path))
@@ -62,14 +88,16 @@ export async function removeAction(
   guard: Guard,
   context: Context,
 ): Promise<RemovePathAction> {
-  await policy.validate(path);
-  await guard(context);
-  return new RemovePathAction(
-    path,
-    reason,
-    await allocatedBytes(path, context),
-    policy,
-    await identity(path),
-    guard,
-  );
+  return unlessVanished(path, async () => {
+    await policy.validate(path);
+    await guard(context);
+    return new RemovePathAction(
+      path,
+      reason,
+      await allocatedBytes(path, context),
+      policy,
+      await identity(path),
+      guard,
+    );
+  });
 }

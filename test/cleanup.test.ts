@@ -822,6 +822,73 @@ test("a path opened after inspection is kept, because each action reads the open
   }
 });
 
+test("a builds candidate that vanishes before du measures it is noted as absent, and the task lists the other candidates", async () => {
+  const { root, policy } = await fixture();
+  try {
+    const gone = await oldProjectWithBuild(join(root, "a"));
+    const kept = await oldProjectWithBuild(join(root, "b"));
+    const local = new LocalHost(10_000);
+    const { host } = fake(async (command) => {
+      if (command.file === "du") {
+        if (command.args.at(-1) === gone) await rm(gone, { recursive: true });
+        return local.run(command, new AbortController().signal);
+      }
+      if (command.file !== "git") return undefined;
+      if (command.args.includes("rev-parse")) return command.args[1];
+      if (command.args.includes("log")) return "1";
+      return "";
+    });
+    const report = await new CleanupRun(
+      [buildsTask("builds", root, policy)],
+      root,
+    ).run(context(host, "preview", []), () => {});
+    assert.equal(report.tasks[0].error, null);
+    assert.deepEqual(
+      report.items.map((item) => [item.target, item.status]),
+      [[kept, "planned"]],
+    );
+    assert.ok(
+      report.tasks[0].notes.some((note) =>
+        note.includes(`Already absent: ${gone}`),
+      ),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a target removed by another process between discovery and apply is skipped as already absent, not failed", async () => {
+  const { root, policy } = await fixture();
+  try {
+    const path = join(root, "archive.vsix");
+    await writeFile(path, "x");
+    await old(path);
+    // Only the action's own check reads the open files here: the target goes while lsof runs.
+    const { host } = fake(async (command) => {
+      if (command.file !== "lsof") return undefined;
+      await rm(path, { force: true });
+      return "";
+    });
+    const report = await new CleanupRun(
+      [
+        new SelectedPathsCleanup(
+          routine,
+          [{ path, select: "self", olderThanDays: 1, reason: "fixture" }],
+          policy,
+        ),
+      ],
+      root,
+    ).run(context(host, "apply", []), () => {});
+    assert.deepEqual(
+      report.items.map((item) => [item.target, item.status]),
+      [[path, "skipped"]],
+    );
+    assert.match(report.items[0].detail, /Already absent/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("recent sibling activity protects nested monorepo dependencies", async () => {
   const { root, policy } = await fixture();
   try {
