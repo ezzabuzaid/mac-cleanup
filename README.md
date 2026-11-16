@@ -4,7 +4,7 @@ A Mac fills up with caches, old app data, unused Node versions and leftovers of 
 
 It does not use a list of known paths. Each task **learns from the machine**: the installed apps, the commands on `PATH`, Homebrew, your git projects, nvm, Docker, and running processes. Each removal is checked again immediately before it runs.
 
-macOS only. Node LTS (see `.nvmrc`). No runtime dependencies.
+macOS only. Node LTS (see `.nvmrc`). One runtime dependency, `@zukhruf/launchd`: run `npm install` once.
 
 ## Use
 

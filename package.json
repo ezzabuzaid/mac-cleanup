@@ -7,6 +7,9 @@
     "typecheck": "nx run disk-cleanup:typecheck",
     "test": "nx run disk-cleanup:test"
   },
+  "dependencies": {
+    "@zukhruf/launchd": "^0.8.19"
+  },
   "devDependencies": {
     "@eslint/js": "9.29.0",
     "@sinonjs/fake-timers": "15.4.0",

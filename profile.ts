@@ -1,5 +1,6 @@
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, dirname } from "node:path";
+import { Launchd } from "@zukhruf/launchd";
 import { MachineInventory } from "./src/machine/inventory.ts";
 import { PathPolicy } from "./src/paths/policy.ts";
 import { CleanupRun } from "./src/run/run.ts";
@@ -27,6 +28,7 @@ const caches = join(home, "Library/Caches");
 const support = join(home, "Library/Application Support");
 const uid = process.getuid?.();
 if (uid === undefined) throw new Error("disk-cleanup runs on macOS");
+const launchd = Launchd.agents({ clock: globalThis });
 
 /** Everything below is learned from this machine when a task runs. */
 const inventory = new MachineInventory({
@@ -239,8 +241,8 @@ export const cleanup = new CleanupRun(
     ),
     new LaunchAgentsCleanup(
       explicit("launch-agents", "LaunchAgents with a missing program", [19]),
-      join(home, "Library/LaunchAgents"),
-      uid,
+      launchd.folder,
+      launchd,
       inventory,
       policy,
     ),

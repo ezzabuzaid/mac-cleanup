@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Launchd } from "@zukhruf/launchd";
 import { MachineInventory } from "../src/machine/inventory.ts";
 import { PathPolicy } from "../src/paths/policy.ts";
 import { exists } from "../src/paths/within.ts";
@@ -475,16 +476,32 @@ test("node-versions is unconfigured, not failed, when nvm is not installed", asy
 
 test("launch-agents removes plists with a missing or absent program and keeps loaded or valid ones", async () => {
   const home = await temporaryHome();
+  const launchd = Launchd.agents({ clock: globalThis });
+  const running = launchd.service("dev.mac-cleanup.test.loaded-running");
+  const idle = launchd.service("dev.mac-cleanup.test.loaded-idle");
   try {
+    for (const service of [running, idle])
+      await launchd.install({
+        Label: service.label,
+        ProgramArguments: ["/bin/sleep", "600"],
+      });
+    await running.kickstart();
     const agents = join(home, "LaunchAgents");
     await mkdir(agents);
     const program = join(home, "real-program");
     await writeFile(program, "");
     const plists: Record<string, object | null> = {
-      "missing.plist": { Label: "x.missing", Program: join(home, "gone") },
+      "missing.plist": {
+        Label: "dev.mac-cleanup.test.missing",
+        Program: join(home, "gone"),
+      },
       "empty.plist": {},
-      "valid.plist": { Label: "x.valid", ProgramArguments: [program] },
-      "loaded.plist": { Label: "x.loaded", Program: join(home, "gone") },
+      "valid.plist": {
+        Label: "dev.mac-cleanup.test.valid",
+        ProgramArguments: [program],
+      },
+      "running.plist": { Label: running.label, Program: join(home, "gone") },
+      "idle.plist": { Label: idle.label, Program: join(home, "gone") },
       "broken.plist": null,
     };
     for (const name of Object.keys(plists))
@@ -495,16 +512,12 @@ test("launch-agents removes plists with a missing or absent program and keeps lo
         if (value === null) throw exit(1);
         return JSON.stringify(value);
       }
-      if (command.file === "launchctl") {
-        if (command.args[1] === "gui/501/x.loaded") return "state = running";
-        throw exit(113);
-      }
       return undefined;
     });
     const cleanup = new LaunchAgentsCleanup(
       task("launch-agents", "explicit"),
       agents,
-      501,
+      launchd,
       inventory(home),
       new PathPolicy([home], []),
     );
@@ -514,9 +527,11 @@ test("launch-agents removes plists with a missing or absent program and keeps lo
       join(agents, "empty.plist"),
       join(agents, "missing.plist"),
     ]);
-    assert.ok(
-      plan.notes.includes("Loaded; run: launchctl bootout gui/501/x.loaded"),
-    );
+    for (const service of [running, idle])
+      assert.ok(
+        plan.notes.includes(`Loaded; run: launchctl bootout ${service.target}`),
+        service.label,
+      );
     assert.ok(
       plan.notes.includes(`Unreadable plist: ${join(agents, "broken.plist")}`),
     );
@@ -528,12 +543,21 @@ test("launch-agents removes plists with a missing or absent program and keeps lo
       ["missing.plist", true],
       ["empty.plist", true],
       ["valid.plist", false],
-      ["loaded.plist", false],
+      ["running.plist", false],
+      ["idle.plist", false],
       ["broken.plist", false],
     ] as const)
       assert.equal(await exists(join(agents, name)), !removed, name);
+    assert.deepEqual(
+      [(await running.state()).state, (await idle.state()).state],
+      ["running", "not running"],
+    );
   } finally {
-    await rm(home, { recursive: true, force: true });
+    await Promise.all([
+      running.uninstall(),
+      idle.uninstall(),
+      rm(home, { recursive: true, force: true }),
+    ]);
   }
 });
 
@@ -844,32 +868,49 @@ test("project artifacts learn git projects and their worktrees, but not repos un
   }
 });
 
-test("launch-agents fails closed when launchctl fails for another reason", async () => {
+test("launch-agents keeps and notes a plist whose label is not one file name, and lists the other candidates", async () => {
   const home = await temporaryHome();
   try {
     const agents = join(home, "LaunchAgents");
     await mkdir(agents);
-    const plist = join(agents, "agent.plist");
-    await writeFile(plist, "");
-    const { host } = fake((command) => {
-      if (command.file === "plutil")
-        return JSON.stringify({
-          Label: "x.agent",
-          Program: join(home, "gone"),
-        });
-      if (command.file === "launchctl") throw exit(5);
-      return undefined;
-    });
+    // launchd loads a job with this label, yet `launchctl print` would look up dev.mac-cleanup.test.
+    const odd = join(agents, "a-slash.plist");
+    const missing = join(agents, "b-missing.plist");
+    const plists: Record<string, object> = {
+      [odd]: {
+        Label: "dev.mac-cleanup.test/slash",
+        Program: join(home, "gone"),
+      },
+      [missing]: {
+        Label: "dev.mac-cleanup.test.absent",
+        Program: join(home, "gone"),
+      },
+    };
+    for (const path of Object.keys(plists)) await writeFile(path, "");
+    const { host } = fake((command) =>
+      command.file === "plutil"
+        ? JSON.stringify(plists[command.args.at(-1)!])
+        : undefined,
+    );
     const plan = await new LaunchAgentsCleanup(
       task("launch-agents", "explicit"),
       agents,
-      501,
+      Launchd.agents({ clock: globalThis }),
       inventory(home),
       new PathPolicy([home], []),
     ).inspect(context(host, "preview", []));
-    assert.match(plan.error ?? "", /exit 5/);
-    assert.equal(plan.actions.length, 0);
-    assert.equal(await exists(plist), true);
+    assert.equal(plan.error, null);
+    assert.deepEqual(
+      plan.actions.map((action) => action.view.target),
+      [missing],
+    );
+    assert.ok(
+      plan.notes.includes(
+        `Kept ${odd}: its label "dev.mac-cleanup.test/slash" is not one file name, so launchd's state cannot be read`,
+      ),
+      plan.notes.join("\n"),
+    );
+    assert.equal(await exists(odd), true);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

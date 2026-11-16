@@ -1,5 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { type AgentJob, type Launchd, type Service } from "@zukhruf/launchd";
 import { MachineInventory } from "../../machine/inventory.ts";
 
 import { PathPolicy } from "../../paths/policy.ts";
@@ -22,19 +23,19 @@ interface Agent {
 /** Per-user LaunchAgents whose program is gone, or that name no program at all. */
 export class LaunchAgentsCleanup extends CleanupTask {
   readonly directory: string;
+  readonly launchd: Launchd<AgentJob>;
   readonly inventory: MachineInventory;
   readonly policy: PathPolicy;
-  readonly uid: number;
   constructor(
     identity: TaskIdentity,
     directory: string,
-    uid: number,
+    launchd: Launchd<AgentJob>,
     inventory: MachineInventory,
     policy: PathPolicy,
   ) {
     super(identity);
     this.directory = directory;
-    this.uid = uid;
+    this.launchd = launchd;
     this.inventory = inventory;
     this.policy = policy;
   }
@@ -53,20 +54,23 @@ export class LaunchAgentsCleanup extends CleanupTask {
       ? null
       : `program not on PATH: ${program}`;
   }
-  /** launchctl exits 113 when the service is not loaded. */
-  private async assertNotLoaded(label: string, context: Context) {
-    const service = `gui/${this.uid}/${label}`;
+  /**
+   * A loaded service keeps its job file; the bootout stays a suggestion. A label that is not one
+   * file name keeps its plist alone; any failed read fails the task closed.
+   */
+  private async assertNotLoaded(label: string, path: string, context: Context) {
+    let service: Service;
     try {
-      await context.host.run(
-        { file: "launchctl", args: ["print", service] },
-        context.signal,
-      );
+      service = this.launchd.service(label);
     } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === 113)
-        return;
-      throw error;
+      if (!(error instanceof RangeError)) throw error;
+      throw new Ineligible(
+        `Kept ${path}: its label ${JSON.stringify(label)} is not one file name, so launchd's state cannot be read`,
+      );
     }
-    throw new Ineligible(`Loaded; run: launchctl bootout ${service}`);
+    const { state } = await service.state({ signal: context.signal });
+    if (state !== "not loaded")
+      throw new Ineligible(`Loaded; run: launchctl bootout ${service.target}`);
   }
   protected async discover(context: Context): Promise<Discovery> {
     const result: Discovery = { actions: [], notes: [], configured: true };
@@ -98,7 +102,7 @@ export class LaunchAgentsCleanup extends CleanupTask {
             `LaunchAgent ${reason}`,
             this.policy,
             async (ctx) => {
-              if (label !== null) await this.assertNotLoaded(label, ctx);
+              if (label !== null) await this.assertNotLoaded(label, path, ctx);
               if ((await this.program(agent)) === null)
                 throw new Ineligible(`Program is back: ${path}`);
             },
