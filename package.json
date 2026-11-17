@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "prepare": "git config core.hooksPath .husky || exit 0",
     "preview": "node cleanup.ts",
     "typecheck": "nx run disk-cleanup:typecheck",
     "test": "nx run disk-cleanup:test"
@@ -11,16 +12,20 @@
     "@zukhruf/launchd": "^0.8.19"
   },
   "devDependencies": {
-    "@eslint/js": "9.29.0",
+    "@eslint/js": "10.0.1",
     "@sinonjs/fake-timers": "15.4.0",
     "@types/node": "24.19.2",
     "@types/sinonjs__fake-timers": "15.0.1",
-    "eslint": "9.29.0",
+    "@zukhruf/git-hooks": "^0.8.21",
+    "eslint": "10.15.0",
     "nx": "23.0.2",
     "prettier": "3.9.5",
     "typescript": "6.0.3",
     "typescript-eslint": "8.63.0"
   },
   "description": "Learns what is safe to clean on a Mac, previews it, and removes only what you allow.",
-  "license": "MIT"
+  "license": "MIT",
+  "allowScripts": {
+    "nx": false
+  }
 }
