@@ -4,7 +4,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { constants, existsSync } from "node:fs";
 import {
-  mkdtemp,
   mkdir,
   open,
   writeFile,
@@ -14,7 +13,8 @@ import {
   realpath,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { TemporaryFiles } from "@zukhruf/fs";
 import { stripVTControlCharacters } from "node:util";
 import { gzipSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
@@ -65,10 +65,15 @@ function fake(handler: (command: Command) => string | undefined) {
 
 /**
  * The profile's policy owns the temp folder as the OS names it (/var/folders/…), so the
- * fixture keeps that form; the policy itself resolves symlinks when it validates a path.
+ * fixture names its folder in that form, not by the real path that TemporaryFiles gives;
+ * the policy itself resolves symlinks when it validates a path.
  */
 async function temporary() {
-  return mkdtemp(join(tmpdir(), "disk-cleanup-workflow-"));
+  const folder = await new TemporaryFiles().directory("disk-cleanup-workflow-");
+  return {
+    path: join(tmpdir(), basename(folder.path)),
+    [Symbol.asyncDispose]: folder.cleanup,
+  };
 }
 
 async function old(path: string) {
@@ -77,122 +82,110 @@ async function old(path: string) {
 }
 
 test("duplicate references require equal contents and preserve the compressed original", async () => {
-  const root = await temporary();
-  try {
-    const original = join(root, "original.gtf.gz");
-    await writeFile(original, gzipSync("same content"));
-    const equal = join(root, "equal.gtf");
-    await writeFile(equal, "same content");
-    await old(equal);
-    const different = join(root, "different.gtf");
-    await writeFile(different, "different");
-    await old(different);
-    // Equal content, but newer than the 7-day threshold.
-    const recent = join(root, "recent.gtf");
-    await writeFile(recent, "same content");
-    const { host } = fake(() => undefined);
-    const duplicates = workflow("duplicate-references");
-    const task = duplicates.build(
-      { groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }] },
-      {},
-    );
-    const plan = await task.inspect(context(host, "preview", []));
-    assert.equal(plan.error, null);
-    assert.equal(plan.actions.length, 1);
-    await plan.actions[0].execute(
-      context(host, "apply", ["duplicate-references"]),
-      duplicates.identity,
-    );
-    assert.equal(await exists(equal), false);
-    assert.equal(await exists(original), true);
-    assert.equal(await exists(different), true);
-    assert.equal(await exists(recent), true);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using folder = await temporary();
+  const root = folder.path;
+  const original = join(root, "original.gtf.gz");
+  await writeFile(original, gzipSync("same content"));
+  const equal = join(root, "equal.gtf");
+  await writeFile(equal, "same content");
+  await old(equal);
+  const different = join(root, "different.gtf");
+  await writeFile(different, "different");
+  await old(different);
+  // Equal content, but newer than the 7-day threshold.
+  const recent = join(root, "recent.gtf");
+  await writeFile(recent, "same content");
+  const { host } = fake(() => undefined);
+  const duplicates = workflow("duplicate-references");
+  const task = duplicates.build(
+    { groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }] },
+    {},
+  );
+  const plan = await task.inspect(context(host, "preview", []));
+  assert.equal(plan.error, null);
+  assert.equal(plan.actions.length, 1);
+  await plan.actions[0].execute(
+    context(host, "apply", ["duplicate-references"]),
+    duplicates.identity,
+  );
+  assert.equal(await exists(equal), false);
+  assert.equal(await exists(original), true);
+  assert.equal(await exists(different), true);
+  assert.equal(await exists(recent), true);
 });
 
 test("SQLite relocation copies rows and updates only the selected setting", async () => {
-  const root = await temporary();
+  await using folder = await temporary();
+  const root = folder.path;
+  const source = join(root, "history.sqlite"),
+    envFile = join(root, ".env"),
+    destination = join(root, "external", "history$&.sqlite");
+  await mkdir(join(root, "external"));
+  const db = new DatabaseSync(source);
+  db.exec(
+    "CREATE TABLE messages (text TEXT); INSERT INTO messages VALUES ('preserve');",
+  );
+  db.close();
+  await writeFile(envFile, `OTHER=keep\nSQLITE_HISTORY_PATH=${source}\n`);
+  const { host } = fake(() => undefined);
+  const relocation = workflow("sqlite-relocation");
+  const task = relocation.build({ source, destination, envFile }, {});
+  const preview = await task.inspect(context(host, "preview", []));
+  assert.equal(await exists(destination), false);
+  await preview.actions[0].execute(
+    context(host, "apply", ["sqlite-relocation"]),
+    relocation.identity,
+  );
+  assert.equal(await exists(source), false);
+  const relocated = new DatabaseSync(destination);
   try {
-    const source = join(root, "history.sqlite"),
-      envFile = join(root, ".env"),
-      destination = join(root, "external", "history$&.sqlite");
-    await mkdir(join(root, "external"));
-    const db = new DatabaseSync(source);
-    db.exec(
-      "CREATE TABLE messages (text TEXT); INSERT INTO messages VALUES ('preserve');",
-    );
-    db.close();
-    await writeFile(envFile, `OTHER=keep\nSQLITE_HISTORY_PATH=${source}\n`);
-    const { host } = fake(() => undefined);
-    const relocation = workflow("sqlite-relocation");
-    const task = relocation.build({ source, destination, envFile }, {});
-    const preview = await task.inspect(context(host, "preview", []));
-    assert.equal(await exists(destination), false);
-    await preview.actions[0].execute(
-      context(host, "apply", ["sqlite-relocation"]),
-      relocation.identity,
-    );
-    assert.equal(await exists(source), false);
-    const relocated = new DatabaseSync(destination);
-    try {
-      assert.equal(
-        relocated.prepare("SELECT text FROM messages").get()!.text,
-        "preserve",
-      );
-    } finally {
-      relocated.close();
-    }
     assert.equal(
-      await readFile(envFile, "utf8"),
-      `OTHER=keep\nSQLITE_HISTORY_PATH=${JSON.stringify(destination)}\n`,
+      relocated.prepare("SELECT text FROM messages").get()!.text,
+      "preserve",
     );
   } finally {
-    await rm(root, { recursive: true, force: true });
+    relocated.close();
   }
+  assert.equal(
+    await readFile(envFile, "utf8"),
+    `OTHER=keep\nSQLITE_HISTORY_PATH=${JSON.stringify(destination)}\n`,
+  );
 });
 
 test("SQLite refuses active WAL, existing destinations, and changed config without removing source", async () => {
-  const root = await temporary();
-  try {
-    const source = join(root, "history.sqlite"),
-      envFile = join(root, ".env"),
-      destination = join(root, "external/history.sqlite");
-    await mkdir(join(root, "external"));
-    const db = new DatabaseSync(source);
-    db.exec("CREATE TABLE x (n)");
-    db.close();
-    await writeFile(envFile, `SQLITE_HISTORY_PATH=${source}\n`);
-    const { host } = fake(() => undefined);
-    const relocation = workflow("sqlite-relocation");
-    const plan = await relocation
-      .build({ source, destination, envFile }, {})
-      .inspect(context(host, "preview", []));
-    const action = plan.actions[0];
-    const ctx = context(host, "apply", ["sqlite-relocation"]);
-    await writeFile(`${source}-wal`, "active");
-    await assert.rejects(
-      action.execute(ctx, relocation.identity),
-      /Checkpoint/,
-    );
-    await rm(`${source}-wal`);
-    await writeFile(destination, "keep");
-    await assert.rejects(
-      action.execute(ctx, relocation.identity),
-      /already exists/,
-    );
-    assert.equal(await readFile(destination, "utf8"), "keep");
-    await rm(destination);
-    await writeFile(envFile, "SQLITE_HISTORY_PATH=changed\n");
-    await assert.rejects(
-      action.execute(ctx, relocation.identity),
-      /Environment file changed/,
-    );
-    assert.equal(await exists(source), true);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using folder = await temporary();
+  const root = folder.path;
+  const source = join(root, "history.sqlite"),
+    envFile = join(root, ".env"),
+    destination = join(root, "external/history.sqlite");
+  await mkdir(join(root, "external"));
+  const db = new DatabaseSync(source);
+  db.exec("CREATE TABLE x (n)");
+  db.close();
+  await writeFile(envFile, `SQLITE_HISTORY_PATH=${source}\n`);
+  const { host } = fake(() => undefined);
+  const relocation = workflow("sqlite-relocation");
+  const plan = await relocation
+    .build({ source, destination, envFile }, {})
+    .inspect(context(host, "preview", []));
+  const action = plan.actions[0];
+  const ctx = context(host, "apply", ["sqlite-relocation"]);
+  await writeFile(`${source}-wal`, "active");
+  await assert.rejects(action.execute(ctx, relocation.identity), /Checkpoint/);
+  await rm(`${source}-wal`);
+  await writeFile(destination, "keep");
+  await assert.rejects(
+    action.execute(ctx, relocation.identity),
+    /already exists/,
+  );
+  assert.equal(await readFile(destination, "utf8"), "keep");
+  await rm(destination);
+  await writeFile(envFile, "SQLITE_HISTORY_PATH=changed\n");
+  await assert.rejects(
+    action.execute(ctx, relocation.identity),
+    /Environment file changed/,
+  );
+  assert.equal(await exists(source), true);
 });
 
 test("workflow input that is missing or wrong is refused and names the field", () => {
@@ -283,65 +276,28 @@ test("the CLI refuses --workflow with --only or --select before it inspects anyt
 });
 
 test("the CLI refuses a --report path it cannot create before it inspects anything", async () => {
-  const root = await temporary();
-  try {
-    const cli = join(import.meta.dirname, "../../cleanup.ts");
-    const input = join(root, "input.json");
-    await writeFile(
-      input,
-      JSON.stringify({
-        groups: [
-          {
-            original: join(root, "absent.gtf.gz"),
-            copies: join(root, "*.gtf"),
-            olderThanDays: 7,
-          },
-        ],
-      }),
-    );
-    const existing = join(root, "existing.json");
-    await writeFile(existing, "keep me");
-    for (const [report, error] of [
-      [join(root, "missing/report.json"), /ENOENT/],
-      [existing, /EEXIST/],
-    ] as const) {
-      const run = spawnSync(
-        process.execPath,
-        [
-          cli,
-          "--workflow",
-          "duplicate-references",
-          "--input",
-          input,
-          "--report",
-          report,
-        ],
-        { encoding: "utf8", timeout: 60_000 },
-      );
-      assert.notEqual(run.status, 0, report);
-      assert.match(run.stderr, error, report);
-      assert.doesNotMatch(run.stderr, /Inspecting/, report);
-    }
-    assert.equal(await readFile(existing, "utf8"), "keep me");
-    assert.equal(existsSync(join(root, "missing")), false);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("a CLI run writes its whole report to the --report file", async () => {
-  const root = await temporary();
-  try {
-    const cli = join(import.meta.dirname, "../../cleanup.ts");
-    const original = join(root, "absent.gtf.gz");
-    const input = join(root, "input.json");
-    await writeFile(
-      input,
-      JSON.stringify({
-        groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }],
-      }),
-    );
-    const report = join(root, "report.json");
+  await using folder = await temporary();
+  const root = folder.path;
+  const cli = join(import.meta.dirname, "../../cleanup.ts");
+  const input = join(root, "input.json");
+  await writeFile(
+    input,
+    JSON.stringify({
+      groups: [
+        {
+          original: join(root, "absent.gtf.gz"),
+          copies: join(root, "*.gtf"),
+          olderThanDays: 7,
+        },
+      ],
+    }),
+  );
+  const existing = join(root, "existing.json");
+  await writeFile(existing, "keep me");
+  for (const [report, error] of [
+    [join(root, "missing/report.json"), /ENOENT/],
+    [existing, /EEXIST/],
+  ] as const) {
     const run = spawnSync(
       process.execPath,
       [
@@ -355,59 +311,87 @@ test("a CLI run writes its whole report to the --report file", async () => {
       ],
       { encoding: "utf8", timeout: 60_000 },
     );
-    assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, new RegExp(`Report: ${report}`));
-    const written = JSON.parse(await readFile(report, "utf8"));
-    assert.equal(written.interrupted, null);
-    assert.deepEqual(
-      written.tasks.map((task: { id: string; notes: string[] }) => [
-        task.id,
-        task.notes,
-      ]),
-      [["duplicate-references", [`Retained original absent: ${original}`]]],
-    );
-  } finally {
-    await rm(root, { recursive: true, force: true });
+    assert.notEqual(run.status, 0, report);
+    assert.match(run.stderr, error, report);
+    assert.doesNotMatch(run.stderr, /Inspecting/, report);
   }
+  assert.equal(await readFile(existing, "utf8"), "keep me");
+  assert.equal(existsSync(join(root, "missing")), false);
+});
+
+test("a CLI run writes its whole report to the --report file", async () => {
+  await using folder = await temporary();
+  const root = folder.path;
+  const cli = join(import.meta.dirname, "../../cleanup.ts");
+  const original = join(root, "absent.gtf.gz");
+  const input = join(root, "input.json");
+  await writeFile(
+    input,
+    JSON.stringify({
+      groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }],
+    }),
+  );
+  const report = join(root, "report.json");
+  const run = spawnSync(
+    process.execPath,
+    [
+      cli,
+      "--workflow",
+      "duplicate-references",
+      "--input",
+      input,
+      "--report",
+      report,
+    ],
+    { encoding: "utf8", timeout: 60_000 },
+  );
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stdout, new RegExp(`Report: ${report}`));
+  const written = JSON.parse(await readFile(report, "utf8"));
+  assert.equal(written.interrupted, null);
+  assert.deepEqual(
+    written.tasks.map((task: { id: string; notes: string[] }) => [
+      task.id,
+      task.notes,
+    ]),
+    [["duplicate-references", [`Retained original absent: ${original}`]]],
+  );
 });
 
 test("a preview prints each task's notes with --details and only their count without it", async () => {
-  const root = await temporary();
-  try {
-    const cli = join(import.meta.dirname, "../../cleanup.ts");
-    const original = join(root, "absent.gtf.gz");
-    const input = join(root, "input.json");
-    await writeFile(
-      input,
-      JSON.stringify({
-        groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }],
-      }),
+  await using folder = await temporary();
+  const root = folder.path;
+  const cli = join(import.meta.dirname, "../../cleanup.ts");
+  const original = join(root, "absent.gtf.gz");
+  const input = join(root, "input.json");
+  await writeFile(
+    input,
+    JSON.stringify({
+      groups: [{ original, copies: join(root, "*.gtf"), olderThanDays: 7 }],
+    }),
+  );
+  const preview = (extra: string[]) =>
+    spawnSync(
+      process.execPath,
+      [cli, "--workflow", "duplicate-references", "--input", input, ...extra],
+      { encoding: "utf8", timeout: 60_000 },
     );
-    const preview = (extra: string[]) =>
-      spawnSync(
-        process.execPath,
-        [cli, "--workflow", "duplicate-references", "--input", input, ...extra],
-        { encoding: "utf8", timeout: 60_000 },
-      );
-    const detailed = preview(["--details"]);
-    assert.equal(detailed.status, 0, detailed.stderr);
-    assert.ok(
-      detailed.stdout.includes(
-        `duplicate-references: Retained original absent: ${original}`,
-      ),
-      detailed.stdout,
-    );
-    const short = preview([]);
-    assert.equal(short.status, 0, short.stderr);
-    assert.ok(!short.stdout.includes("Retained original absent"), short.stdout);
-    // Nx forces color, so console.table wraps each value in terminal codes.
-    assert.match(
-      stripVTControlCharacters(short.stdout),
-      /'duplicate-references'.*│ 1 +│$/m,
-    );
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  const detailed = preview(["--details"]);
+  assert.equal(detailed.status, 0, detailed.stderr);
+  assert.ok(
+    detailed.stdout.includes(
+      `duplicate-references: Retained original absent: ${original}`,
+    ),
+    detailed.stdout,
+  );
+  const short = preview([]);
+  assert.equal(short.status, 0, short.stderr);
+  assert.ok(!short.stdout.includes("Retained original absent"), short.stdout);
+  // Nx forces color, so console.table wraps each value in terminal codes.
+  assert.match(
+    stripVTControlCharacters(short.stdout),
+    /'duplicate-references'.*│ 1 +│$/m,
+  );
 });
 
 test(
@@ -419,7 +403,8 @@ test(
       ["SIGINT", 130],
       ["SIGTERM", 143],
     ] as const) {
-      const root = await temporary();
+      await using folder = await temporary();
+      const root = folder.path;
       // The workflow hashes its original during inspect. A FIFO whose write end this test
       // holds keeps that read waiting, so the signal always lands inside the run. The write
       // end stays open until the CLI exits: without a writer, the CLI's open of the FIFO
@@ -488,7 +473,6 @@ test(
         }
       } finally {
         await writer.close();
-        await rm(root, { recursive: true, force: true });
       }
     }
   },
@@ -500,7 +484,8 @@ test(
   async () => {
     const cli = join(import.meta.dirname, "../../cleanup.ts");
     for (const signal of ["SIGINT", "SIGTERM"] as const) {
-      const root = await temporary();
+      await using folder = await temporary();
+      const root = folder.path;
       // This test never writes to the FIFO, so the workflow's hash read waits until the
       // process ends: only the second signal can end the run.
       const original = join(root, "original.gtf.gz");
@@ -550,7 +535,6 @@ test(
         }
       } finally {
         await writer.close();
-        await rm(root, { recursive: true, force: true });
       }
     }
   },
@@ -576,86 +560,77 @@ test("docker-offload refuses a destination that is not an SSH context", async ()
 });
 
 test("SQLite relocation keeps the source while a process has it open", async () => {
-  const root = await temporary();
-  try {
-    const source = join(root, "history.sqlite"),
-      envFile = join(root, ".env"),
-      destination = join(root, "external/history.sqlite");
-    await mkdir(join(root, "external"));
-    const db = new DatabaseSync(source);
-    db.exec("CREATE TABLE x (n)");
-    db.close();
-    await writeFile(envFile, `SQLITE_HISTORY_PATH=${source}\n`);
-    const relocation = workflow("sqlite-relocation");
-    const plan = await relocation
-      .build({ source, destination, envFile }, {})
-      .inspect(context(fake(() => undefined).host, "preview", []));
-    // lsof reports canonical paths (/private/var/…).
-    const canonical = await realpath(source);
-    const { host } = fake((command) =>
-      command.file === "lsof" ? `p7\nn${canonical}\n` : undefined,
-    );
-    await assert.rejects(
-      plan.actions[0].execute(
-        context(host, "apply", ["sqlite-relocation"]),
-        relocation.identity,
-      ),
-      /Open files/,
-    );
-    assert.equal(await exists(source), true);
-    assert.equal(await exists(destination), false);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using folder = await temporary();
+  const root = folder.path;
+  const source = join(root, "history.sqlite"),
+    envFile = join(root, ".env"),
+    destination = join(root, "external/history.sqlite");
+  await mkdir(join(root, "external"));
+  const db = new DatabaseSync(source);
+  db.exec("CREATE TABLE x (n)");
+  db.close();
+  await writeFile(envFile, `SQLITE_HISTORY_PATH=${source}\n`);
+  const relocation = workflow("sqlite-relocation");
+  const plan = await relocation
+    .build({ source, destination, envFile }, {})
+    .inspect(context(fake(() => undefined).host, "preview", []));
+  // lsof reports canonical paths (/private/var/…).
+  const canonical = await realpath(source);
+  const { host } = fake((command) =>
+    command.file === "lsof" ? `p7\nn${canonical}\n` : undefined,
+  );
+  await assert.rejects(
+    plan.actions[0].execute(
+      context(host, "apply", ["sqlite-relocation"]),
+      relocation.identity,
+    ),
+    /Open files/,
+  );
+  assert.equal(await exists(source), true);
+  assert.equal(await exists(destination), false);
 });
 
 test("SQLite relocation rolls back when the source is opened after the copy", async () => {
-  const root = await temporary();
+  await using folder = await temporary();
+  const root = folder.path;
+  const source = join(root, "history.sqlite"),
+    envFile = join(root, ".env"),
+    destination = join(root, "external/history.sqlite");
+  await mkdir(join(root, "external"));
+  const db = new DatabaseSync(source);
+  db.exec(
+    "CREATE TABLE messages (text TEXT); INSERT INTO messages VALUES ('keep');",
+  );
+  db.close();
+  const env = `SQLITE_HISTORY_PATH=${source}\n`;
+  await writeFile(envFile, env);
+  const relocation = workflow("sqlite-relocation");
+  const plan = await relocation
+    .build({ source, destination, envFile }, {})
+    .inspect(context(fake(() => undefined).host, "preview", []));
+  const canonical = await realpath(source);
+  // A process opens the source once the copy exists: lsof answers from that state.
+  const { host } = fake((command) =>
+    command.file === "lsof"
+      ? existsSync(destination)
+        ? `p7\nn${canonical}\n`
+        : ""
+      : undefined,
+  );
+  await assert.rejects(
+    plan.actions[0].execute(
+      context(host, "apply", ["sqlite-relocation"]),
+      relocation.identity,
+    ),
+    /Open files/,
+  );
+  assert.equal(await exists(destination), false);
+  assert.equal(await readFile(envFile, "utf8"), env);
+  const kept = new DatabaseSync(source);
   try {
-    const source = join(root, "history.sqlite"),
-      envFile = join(root, ".env"),
-      destination = join(root, "external/history.sqlite");
-    await mkdir(join(root, "external"));
-    const db = new DatabaseSync(source);
-    db.exec(
-      "CREATE TABLE messages (text TEXT); INSERT INTO messages VALUES ('keep');",
-    );
-    db.close();
-    const env = `SQLITE_HISTORY_PATH=${source}\n`;
-    await writeFile(envFile, env);
-    const relocation = workflow("sqlite-relocation");
-    const plan = await relocation
-      .build({ source, destination, envFile }, {})
-      .inspect(context(fake(() => undefined).host, "preview", []));
-    const canonical = await realpath(source);
-    // A process opens the source once the copy exists: lsof answers from that state.
-    const { host } = fake((command) =>
-      command.file === "lsof"
-        ? existsSync(destination)
-          ? `p7\nn${canonical}\n`
-          : ""
-        : undefined,
-    );
-    await assert.rejects(
-      plan.actions[0].execute(
-        context(host, "apply", ["sqlite-relocation"]),
-        relocation.identity,
-      ),
-      /Open files/,
-    );
-    assert.equal(await exists(destination), false);
-    assert.equal(await readFile(envFile, "utf8"), env);
-    const kept = new DatabaseSync(source);
-    try {
-      assert.equal(
-        kept.prepare("SELECT text FROM messages").get()!.text,
-        "keep",
-      );
-    } finally {
-      kept.close();
-    }
+    assert.equal(kept.prepare("SELECT text FROM messages").get()!.text, "keep");
   } finally {
-    await rm(root, { recursive: true, force: true });
+    kept.close();
   }
 });
 
@@ -723,16 +698,13 @@ async function runAirbyte(
 ) {
   const { host, calls } = airbyteHost(state);
   const airbyte = workflow("airbyte");
-  const root = await temporary();
-  try {
-    const report = await new CleanupRun(
-      [airbyte.build(airbyteInput, env)],
-      root,
-    ).run(context(host, "apply", ["airbyte"]), () => {});
-    return { report, calls };
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using folder = await temporary();
+  const root = folder.path;
+  const report = await new CleanupRun(
+    [airbyte.build(airbyteInput, env)],
+    root,
+  ).run(context(host, "apply", ["airbyte"]), () => {});
+  return { report, calls };
 }
 
 const uninstalled = (calls: Command[]) =>

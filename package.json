@@ -9,13 +9,14 @@
     "test": "nx run disk-cleanup:test"
   },
   "dependencies": {
-    "@zukhruf/launchd": "^0.8.19"
+    "@zukhruf/launchd": "^0.8.21"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@sinonjs/fake-timers": "15.4.0",
     "@types/node": "24.19.2",
     "@types/sinonjs__fake-timers": "15.0.1",
+    "@zukhruf/fs": "^0.8.21",
     "@zukhruf/git-hooks": "^0.8.21",
     "eslint": "10.15.0",
     "nx": "23.0.2",

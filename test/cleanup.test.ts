@@ -4,17 +4,15 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createClock } from "@sinonjs/fake-timers";
 import {
-  mkdtemp,
   mkdir,
   writeFile,
   readFile,
   rm,
   symlink,
   utimes,
-  realpath,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TemporaryFiles } from "@zukhruf/fs";
 import { cleanup } from "../profile.ts";
 import { MachineInventory } from "../src/machine/inventory.ts";
 import { PathPolicy } from "../src/paths/policy.ts";
@@ -90,12 +88,14 @@ function plist(values: Record<string, string>, command: Command) {
     throw Object.assign(new Error("No value at that key path"), { code: 1 });
   return value;
 }
-/** A temp root and a policy that owns it; each test removes the root in its own finally. */
+/** A temp root and a policy that owns it; disposing the fixture removes the root. */
 async function fixture() {
-  const root = await realpath(
-    await mkdtemp(join(tmpdir(), "disk-cleanup-test-")),
-  );
-  return { root, policy: new PathPolicy([root], []) };
+  const folder = await new TemporaryFiles().directory("disk-cleanup-test-");
+  return {
+    root: folder.path,
+    policy: new PathPolicy([folder.path], []),
+    [Symbol.asyncDispose]: folder.cleanup,
+  };
 }
 
 async function old(path: string) {
@@ -104,326 +104,303 @@ async function old(path: string) {
 }
 
 test("preview is read-only, including a direct action execute call", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const path = join(root, "cache");
-    await writeFile(path, "keep me");
-    const { host } = fake(() => undefined);
-    const task = new SelectedPathsCleanup(
-      routine,
-      [{ path, select: "self", olderThanDays: 0, reason: "fixture" }],
-      policy,
-    );
-    const ctx = context(host, "preview", []);
-    const report = await new CleanupRun([task], root).run(ctx, () => {});
-    assert.equal(report.items[0].status, "planned");
-    assert.equal(await readFile(path, "utf8"), "keep me");
-    const plan = await task.inspect(ctx);
-    await assert.rejects(
-      plan.actions[0].execute(ctx, routine),
-      /forbidden in preview/,
-    );
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const path = join(root, "cache");
+  await writeFile(path, "keep me");
+  const { host } = fake(() => undefined);
+  const task = new SelectedPathsCleanup(
+    routine,
+    [{ path, select: "self", olderThanDays: 0, reason: "fixture" }],
+    policy,
+  );
+  const ctx = context(host, "preview", []);
+  const report = await new CleanupRun([task], root).run(ctx, () => {});
+  assert.equal(report.items[0].status, "planned");
+  assert.equal(await readFile(path, "utf8"), "keep me");
+  const plan = await task.inspect(ctx);
+  await assert.rejects(
+    plan.actions[0].execute(ctx, routine),
+    /forbidden in preview/,
+  );
 });
 
 test("explicit tasks need their exact allow ID and remove only the selected file", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const path = join(root, "chosen");
-    const keep = join(root, "keep");
-    await writeFile(path, "delete fixture");
-    await writeFile(keep, "keep");
-    const { host } = fake(() => undefined);
-    const action = await removeAction(
-      path,
-      "fixture",
-      policy,
-      noop,
-      context(host, "preview", []),
-    );
-    await assert.rejects(
-      action.execute(context(host, "apply", []), explicit),
-      /Requires --allow fixture/,
-    );
-    await action.execute(context(host, "apply", ["fixture"]), explicit);
-    assert.equal(await exists(path), false);
-    assert.equal(await readFile(keep, "utf8"), "keep");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const path = join(root, "chosen");
+  const keep = join(root, "keep");
+  await writeFile(path, "delete fixture");
+  await writeFile(keep, "keep");
+  const { host } = fake(() => undefined);
+  const action = await removeAction(
+    path,
+    "fixture",
+    policy,
+    noop,
+    context(host, "preview", []),
+  );
+  await assert.rejects(
+    action.execute(context(host, "apply", []), explicit),
+    /Requires --allow fixture/,
+  );
+  await action.execute(context(host, "apply", ["fixture"]), explicit);
+  assert.equal(await exists(path), false);
+  assert.equal(await readFile(keep, "utf8"), "keep");
 });
 
 test("changed files and open files are rechecked immediately before removal", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const path = join(root, "chosen");
-    await writeFile(path, "first");
-    const { host } = fake(() => undefined);
-    const action = await removeAction(
-      path,
-      "fixture",
-      policy,
-      noop,
-      context(host, "preview", []),
-    );
-    await writeFile(path, "changed contents");
-    await assert.rejects(
-      action.execute(context(host, "apply", []), routine),
-      /Changed since inspection/,
-    );
-    const active = fake((command) =>
-      command.file === "lsof" ? `p123\nn${path}\n` : undefined,
-    );
-    const second = await removeAction(
-      path,
-      "fixture",
-      policy,
-      noop,
-      context(active.host, "preview", []),
-    );
-    await assert.rejects(
-      second.execute(context(active.host, "apply", []), routine),
-      /Open files/,
-    );
-    assert.equal(await readFile(path, "utf8"), "changed contents");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const path = join(root, "chosen");
+  await writeFile(path, "first");
+  const { host } = fake(() => undefined);
+  const action = await removeAction(
+    path,
+    "fixture",
+    policy,
+    noop,
+    context(host, "preview", []),
+  );
+  await writeFile(path, "changed contents");
+  await assert.rejects(
+    action.execute(context(host, "apply", []), routine),
+    /Changed since inspection/,
+  );
+  const active = fake((command) =>
+    command.file === "lsof" ? `p123\nn${path}\n` : undefined,
+  );
+  const second = await removeAction(
+    path,
+    "fixture",
+    policy,
+    noop,
+    context(active.host, "preview", []),
+  );
+  await assert.rejects(
+    second.execute(context(active.host, "apply", []), routine),
+    /Open files/,
+  );
+  assert.equal(await readFile(path, "utf8"), "changed contents");
 });
 
 test("protected ancestors, path escapes, target and intermediate symlinks are rejected", async () => {
-  const { root } = await fixture();
-  try {
-    const folder = join(root, "folder");
-    await mkdir(folder);
-    const protectedPath = join(folder, "history.sqlite");
-    await writeFile(protectedPath, "data");
-    const policy = new PathPolicy([root], [protectedPath]);
-    await assert.rejects(policy.validate(folder), /Protected/);
-    await assert.rejects(policy.validate(root), /owned root/);
-    await assert.rejects(policy.validate(join(root, "..")), /owned root/);
-    const target = join(root, "data");
-    await mkdir(target);
-    await writeFile(join(target, "file"), "data");
-    const link = join(root, "link");
-    await symlink(target, link);
-    await assert.rejects(policy.validate(link), /Symlink/);
-    await assert.rejects(policy.validate(join(link, "file")), /Symlink/);
-    await assert.rejects(policy.validateNew(join(link, "new")), /Symlink/);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root } = scratch;
+  const folder = join(root, "folder");
+  await mkdir(folder);
+  const protectedPath = join(folder, "history.sqlite");
+  await writeFile(protectedPath, "data");
+  const policy = new PathPolicy([root], [protectedPath]);
+  await assert.rejects(policy.validate(folder), /Protected/);
+  await assert.rejects(policy.validate(root), /owned root/);
+  await assert.rejects(policy.validate(join(root, "..")), /owned root/);
+  const target = join(root, "data");
+  await mkdir(target);
+  await writeFile(join(target, "file"), "data");
+  const link = join(root, "link");
+  await symlink(target, link);
+  await assert.rejects(policy.validate(link), /Symlink/);
+  await assert.rejects(policy.validate(join(link, "file")), /Symlink/);
+  await assert.rejects(policy.validateNew(join(link, "new")), /Symlink/);
 });
 
 test("command discovery failures remain errors and later tasks still inspect", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const bad = new PackageCacheCleanup(routine, "npm", null, policy);
-    const good = new SelectedPathsCleanup(
-      { ...routine, id: "other" },
-      [],
-      policy,
-    );
-    const host: Host = {
-      async run() {
-        throw new Error("native failure");
-      },
-    };
-    const result = await new CleanupRun([bad, good], root).run(
-      context(host, "preview", []),
-      () => {},
-    );
-    assert.match(result.tasks[0].error!, /native failure/);
-    assert.equal(result.tasks[1].configured, false);
-    assert.throws(() => new CleanupRun([bad, bad], root), /Duplicate/);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const bad = new PackageCacheCleanup(routine, "npm", null, policy);
+  const good = new SelectedPathsCleanup(
+    { ...routine, id: "other" },
+    [],
+    policy,
+  );
+  const host: Host = {
+    async run() {
+      throw new Error("native failure");
+    },
+  };
+  const result = await new CleanupRun([bad, good], root).run(
+    context(host, "preview", []),
+    () => {},
+  );
+  assert.match(result.tasks[0].error!, /native failure/);
+  assert.equal(result.tasks[1].configured, false);
+  assert.throws(() => new CleanupRun([bad, bad], root), /Duplicate/);
 });
 
 test("an interrupted run keeps the actions it completed and starts no later task", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const names = ["done", "cut", "later"];
-    for (const name of names) {
-      await writeFile(join(root, name), "x");
-      await old(join(root, name));
-    }
-    const tasks = names.map(
-      (name) =>
-        new SelectedPathsCleanup(
-          { ...routine, id: name },
-          [
-            {
-              path: join(root, name),
-              select: "self",
-              olderThanDays: 7,
-              reason: "fixture",
-            },
-          ],
-          policy,
-        ),
-    );
-    const { host: answers } = fake(() => undefined);
-    const { promise: blocked, resolve: block } = Promise.withResolvers<void>();
-    const host: Host = {
-      run(command, signal) {
-        if (command.file !== "du" || command.args.at(-1) !== join(root, "cut"))
-          return answers.run(command, signal);
-        block();
-        return new Promise((_, reject) =>
-          signal.addEventListener("abort", () => reject(signal.reason), {
-            once: true,
-          }),
-        );
-      },
-    };
-    const controller = new AbortController();
-    const progress: string[] = [];
-    const running = new CleanupRun(tasks, root).run(
-      { ...context(host, "apply", []), signal: controller.signal },
-      (message) => progress.push(message),
-    );
-    await blocked;
-    controller.abort(new Error("Interrupted by SIGINT"));
-    const report = await running;
-    assert.equal(report.interrupted, "Interrupted by SIGINT");
-    assert.deepEqual(
-      report.items.map((item) => [item.target, item.status]),
-      [[join(root, "done"), "completed"]],
-    );
-    assert.deepEqual(
-      report.tasks.map((task) => task.id),
-      ["done"],
-    );
-    assert.deepEqual(progress, ["Inspecting done", "Inspecting cut"]);
-    assert.equal(await exists(join(root, "done")), false);
-    assert.equal(await exists(join(root, "cut")), true);
-    assert.equal(await exists(join(root, "later")), true);
-  } finally {
-    await rm(root, { recursive: true, force: true });
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const names = ["done", "cut", "later"];
+  for (const name of names) {
+    await writeFile(join(root, name), "x");
+    await old(join(root, name));
   }
-});
-
-test("an abort during an action marks it interrupted and leaves the later actions planned", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const folder = join(root, "downloads");
-    await mkdir(folder);
-    for (const name of ["a", "b", "c"]) {
-      await writeFile(join(folder, name), "x");
-      await old(join(folder, name));
-    }
-    const later = join(root, "later");
-    await writeFile(later, "x");
-    await old(later);
-    const tasks = [
+  const tasks = names.map(
+    (name) =>
       new SelectedPathsCleanup(
-        routine,
+        { ...routine, id: name },
         [
           {
-            path: folder,
-            select: "children",
+            path: join(root, name),
+            select: "self",
             olderThanDays: 7,
             reason: "fixture",
           },
         ],
         policy,
       ),
-      new SelectedPathsCleanup(
-        { ...routine, id: "later" },
-        [{ path: later, select: "self", olderThanDays: 7, reason: "fixture" }],
-        policy,
-      ),
-    ];
-    const { host: answers } = fake(() => undefined);
-    const { promise: blocked, resolve: block } = Promise.withResolvers<void>();
-    let openFileChecks = 0;
-    const host: Host = {
-      run(command, signal) {
-        if (command.file !== "lsof" || ++openFileChecks !== 2)
-          return answers.run(command, signal);
-        block();
-        return new Promise((_, reject) =>
-          signal.addEventListener("abort", () => reject(signal.reason), {
-            once: true,
-          }),
-        );
-      },
-    };
-    const controller = new AbortController();
-    const progress: string[] = [];
-    const running = new CleanupRun(tasks, root).run(
-      { ...context(host, "apply", []), signal: controller.signal },
-      (message) => progress.push(message),
-    );
-    await blocked;
-    controller.abort(new Error("Interrupted by SIGTERM"));
-    const report = await running;
-    assert.equal(report.interrupted, "Interrupted by SIGTERM");
-    assert.deepEqual(
-      report.items.map((item) => [item.status, item.detail]),
-      [
-        ["completed", ""],
-        ["interrupted", "Interrupted by SIGTERM"],
-        ["planned", ""],
-      ],
-    );
-    for (const item of report.items)
-      assert.equal(
-        await exists(item.target),
-        item.status !== "completed",
-        item.target,
+  );
+  const { host: answers } = fake(() => undefined);
+  const { promise: blocked, resolve: block } = Promise.withResolvers<void>();
+  const host: Host = {
+    run(command, signal) {
+      if (command.file !== "du" || command.args.at(-1) !== join(root, "cut"))
+        return answers.run(command, signal);
+      block();
+      return new Promise((_, reject) =>
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        }),
       );
-    assert.deepEqual(progress, [`Inspecting ${routine.id}`]);
-    assert.deepEqual(
-      report.tasks.map((task) => task.id),
-      [routine.id],
-    );
-    assert.equal(await exists(later), true);
-  } finally {
-    await rm(root, { recursive: true, force: true });
+    },
+  };
+  const controller = new AbortController();
+  const progress: string[] = [];
+  const running = new CleanupRun(tasks, root).run(
+    { ...context(host, "apply", []), signal: controller.signal },
+    (message) => progress.push(message),
+  );
+  await blocked;
+  controller.abort(new Error("Interrupted by SIGINT"));
+  const report = await running;
+  assert.equal(report.interrupted, "Interrupted by SIGINT");
+  assert.deepEqual(
+    report.items.map((item) => [item.target, item.status]),
+    [[join(root, "done"), "completed"]],
+  );
+  assert.deepEqual(
+    report.tasks.map((task) => task.id),
+    ["done"],
+  );
+  assert.deepEqual(progress, ["Inspecting done", "Inspecting cut"]);
+  assert.equal(await exists(join(root, "done")), false);
+  assert.equal(await exists(join(root, "cut")), true);
+  assert.equal(await exists(join(root, "later")), true);
+});
+
+test("an abort during an action marks it interrupted and leaves the later actions planned", async () => {
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const folder = join(root, "downloads");
+  await mkdir(folder);
+  for (const name of ["a", "b", "c"]) {
+    await writeFile(join(folder, name), "x");
+    await old(join(folder, name));
   }
+  const later = join(root, "later");
+  await writeFile(later, "x");
+  await old(later);
+  const tasks = [
+    new SelectedPathsCleanup(
+      routine,
+      [
+        {
+          path: folder,
+          select: "children",
+          olderThanDays: 7,
+          reason: "fixture",
+        },
+      ],
+      policy,
+    ),
+    new SelectedPathsCleanup(
+      { ...routine, id: "later" },
+      [{ path: later, select: "self", olderThanDays: 7, reason: "fixture" }],
+      policy,
+    ),
+  ];
+  const { host: answers } = fake(() => undefined);
+  const { promise: blocked, resolve: block } = Promise.withResolvers<void>();
+  let openFileChecks = 0;
+  const host: Host = {
+    run(command, signal) {
+      if (command.file !== "lsof" || ++openFileChecks !== 2)
+        return answers.run(command, signal);
+      block();
+      return new Promise((_, reject) =>
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        }),
+      );
+    },
+  };
+  const controller = new AbortController();
+  const progress: string[] = [];
+  const running = new CleanupRun(tasks, root).run(
+    { ...context(host, "apply", []), signal: controller.signal },
+    (message) => progress.push(message),
+  );
+  await blocked;
+  controller.abort(new Error("Interrupted by SIGTERM"));
+  const report = await running;
+  assert.equal(report.interrupted, "Interrupted by SIGTERM");
+  assert.deepEqual(
+    report.items.map((item) => [item.status, item.detail]),
+    [
+      ["completed", ""],
+      ["interrupted", "Interrupted by SIGTERM"],
+      ["planned", ""],
+    ],
+  );
+  for (const item of report.items)
+    assert.equal(
+      await exists(item.target),
+      item.status !== "completed",
+      item.target,
+    );
+  assert.deepEqual(progress, [`Inspecting ${routine.id}`]);
+  assert.deepEqual(
+    report.tasks.map((task) => task.id),
+    [routine.id],
+  );
+  assert.equal(await exists(later), true);
 });
 
 test("npm uses its native cache command and preserves npx contents", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const cache = join(root, "npm");
-    await mkdir(join(cache, "_cacache"), { recursive: true });
-    await mkdir(join(cache, "_npx"));
-    await writeFile(join(cache, "_npx", "tool"), "installed");
-    const { host, calls } = fake(async (command) => {
-      if (command.file === "npm") {
-        assert.deepEqual(command.args, [
-          "cache",
-          "clean",
-          "--force",
-          "--cache",
-          cache,
-        ]);
-        await rm(join(cache, "_cacache"), { recursive: true });
-        return "";
-      }
-      if (command.file === "ps") return "";
-    });
-    const task = new PackageCacheCleanup(routine, "npm", cache, policy);
-    const plan = await task.inspect(context(host, "preview", []));
-    assert.equal(
-      calls.some((c) => c.file === "npm"),
-      false,
-    );
-    await plan.actions[0].execute(context(host, "apply", []), routine);
-    assert.equal(await readFile(join(cache, "_npx/tool"), "utf8"), "installed");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const cache = join(root, "npm");
+  await mkdir(join(cache, "_cacache"), { recursive: true });
+  await mkdir(join(cache, "_npx"));
+  await writeFile(join(cache, "_npx", "tool"), "installed");
+  const { host, calls } = fake(async (command) => {
+    if (command.file === "npm") {
+      assert.deepEqual(command.args, [
+        "cache",
+        "clean",
+        "--force",
+        "--cache",
+        cache,
+      ]);
+      await rm(join(cache, "_cacache"), { recursive: true });
+      return "";
+    }
+    if (command.file === "ps") return "";
+  });
+  const task = new PackageCacheCleanup(routine, "npm", cache, policy);
+  const plan = await task.inspect(context(host, "preview", []));
+  assert.equal(
+    calls.some((c) => c.file === "npm"),
+    false,
+  );
+  await plan.actions[0].execute(context(host, "apply", []), routine);
+  assert.equal(await readFile(join(cache, "_npx/tool"), "utf8"), "installed");
 });
 
 test("the npm task skips, with a note, while a real process titled npm install runs", async () => {
-  const { root, policy } = await fixture();
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
   // npm sets its own process.title; this is that mechanism, without a registry.
   const install = spawn(
     process.execPath,
@@ -460,32 +437,28 @@ test("the npm task skips, with a note, while a real process titled npm install r
     );
   } finally {
     install.kill();
-    await rm(root, { recursive: true, force: true });
   }
 });
 
 /** Applies one package-cache task against a stubbed process list, in a temp root. */
 async function applyCacheTask(manager: PackageManager, processes: string) {
-  const { root, policy } = await fixture();
-  try {
-    const cache = join(root, manager);
-    await mkdir(join(cache, "_cacache"), { recursive: true });
-    const { host, calls } = fake((command) => {
-      if (command.file === "ps") return processes;
-      if (command.file === manager || command.file === "pip3") return "";
-    });
-    const report = await new CleanupRun(
-      [new PackageCacheCleanup(routine, manager, cache, policy)],
-      root,
-    ).run(context(host, "apply", []), () => {});
-    return {
-      status: report.items[0].status,
-      detail: report.items[0].detail,
-      cleaned: calls.some((c) => c.file === manager || c.file === "pip3"),
-    };
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const cache = join(root, manager);
+  await mkdir(join(cache, "_cacache"), { recursive: true });
+  const { host, calls } = fake((command) => {
+    if (command.file === "ps") return processes;
+    if (command.file === manager || command.file === "pip3") return "";
+  });
+  const report = await new CleanupRun(
+    [new PackageCacheCleanup(routine, manager, cache, policy)],
+    root,
+  ).run(context(host, "apply", []), () => {});
+  return {
+    status: report.items[0].status,
+    detail: report.items[0].detail,
+    cleaned: calls.some((c) => c.file === manager || c.file === "pip3"),
+  };
 }
 
 test("the npm task skips while npm ci or npm i runs, whatever the process list holds around it", async () => {
@@ -556,26 +529,23 @@ test("the pip task skips while pip runs, and another manager's install does not 
 });
 
 test("a process list that cannot be read fails the action and leaves the cache alone", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const cache = join(root, "npm");
-    await mkdir(join(cache, "_cacache"), { recursive: true });
-    const { host, calls } = fake((command) => {
-      if (command.file === "ps") throw new Error("ps refused");
-    });
-    const report = await new CleanupRun(
-      [new PackageCacheCleanup(routine, "npm", cache, policy)],
-      root,
-    ).run(context(host, "apply", []), () => {});
-    assert.equal(report.items[0].status, "failed");
-    assert.match(report.items[0].detail, /ps refused/);
-    assert.equal(
-      calls.some((c) => c.file === "npm"),
-      false,
-    );
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const cache = join(root, "npm");
+  await mkdir(join(cache, "_cacache"), { recursive: true });
+  const { host, calls } = fake((command) => {
+    if (command.file === "ps") throw new Error("ps refused");
+  });
+  const report = await new CleanupRun(
+    [new PackageCacheCleanup(routine, "npm", cache, policy)],
+    root,
+  ).run(context(host, "apply", []), () => {});
+  assert.equal(report.items[0].status, "failed");
+  assert.match(report.items[0].detail, /ps refused/);
+  assert.equal(
+    calls.some((c) => c.file === "npm"),
+    false,
+  );
 });
 
 test("a silent step prints a heartbeat that names it, a new step restarts the silence, and dispose ends it", async () => {
@@ -759,323 +729,297 @@ function buildsTask(id: string, root: string, policy: PathPolicy) {
 
 test("inspection reads the open files once per run, in apply as in preview, across tasks and candidates", async () => {
   for (const mode of ["preview", "apply"] as const) {
-    const { root, policy } = await fixture();
-    try {
-      await oldProjectWithBuild(join(root, "a"));
-      await oldProjectWithBuild(join(root, "b"));
-      await oldProjectWithBuild(join(root, "c"));
-      const { host, calls } = fake((command) => {
-        if (command.file !== "git") return undefined;
-        if (command.args.includes("rev-parse")) return command.args[1];
-        // Uncommitted work: each candidate passes its open-file check, and no action follows.
-        if (command.args.includes("status")) return " M file";
-        return "";
-      });
-      const report = await new CleanupRun(
-        [buildsTask("first", root, policy), buildsTask("second", root, policy)],
-        root,
-      ).run(context(host, mode, []), () => {});
-      assert.deepEqual(
-        report.tasks.map((task) => task.notes.length),
-        [3, 3],
-        mode,
-      );
-      assert.equal(report.items.length, 0, mode);
-      assert.equal(calls.filter((c) => c.file === "lsof").length, 1, mode);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
+    await using scratch = await fixture();
+    const { root, policy } = scratch;
+    await oldProjectWithBuild(join(root, "a"));
+    await oldProjectWithBuild(join(root, "b"));
+    await oldProjectWithBuild(join(root, "c"));
+    const { host, calls } = fake((command) => {
+      if (command.file !== "git") return undefined;
+      if (command.args.includes("rev-parse")) return command.args[1];
+      // Uncommitted work: each candidate passes its open-file check, and no action follows.
+      if (command.args.includes("status")) return " M file";
+      return "";
+    });
+    const report = await new CleanupRun(
+      [buildsTask("first", root, policy), buildsTask("second", root, policy)],
+      root,
+    ).run(context(host, mode, []), () => {});
+    assert.deepEqual(
+      report.tasks.map((task) => task.notes.length),
+      [3, 3],
+      mode,
+    );
+    assert.equal(report.items.length, 0, mode);
+    assert.equal(calls.filter((c) => c.file === "lsof").length, 1, mode);
   }
 });
 
 test("a path opened after inspection is kept, because each action reads the open files again", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const first = await oldProjectWithBuild(join(root, "a"));
-    const second = await oldProjectWithBuild(join(root, "b"));
-    const { host } = fake(async (command) => {
-      if (command.file === "lsof")
-        return (await exists(first))
-          ? ""
-          : `p123\nn${join(second, "bundle.js")}\n`;
-      if (command.file !== "git") return undefined;
-      if (command.args.includes("rev-parse")) return command.args[1];
-      if (command.args.includes("log")) return "1";
-      return "";
-    });
-    const report = await new CleanupRun(
-      [buildsTask("builds", root, policy)],
-      root,
-    ).run(context(host, "apply", []), () => {});
-    assert.deepEqual(
-      report.items.map((item) => [item.target, item.status]),
-      [
-        [first, "completed"],
-        [second, "skipped"],
-      ],
-    );
-    assert.match(report.items[1].detail, /Open files/);
-    assert.equal(await exists(first), false);
-    assert.equal(await readFile(join(second, "bundle.js"), "utf8"), "x");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const first = await oldProjectWithBuild(join(root, "a"));
+  const second = await oldProjectWithBuild(join(root, "b"));
+  const { host } = fake(async (command) => {
+    if (command.file === "lsof")
+      return (await exists(first))
+        ? ""
+        : `p123\nn${join(second, "bundle.js")}\n`;
+    if (command.file !== "git") return undefined;
+    if (command.args.includes("rev-parse")) return command.args[1];
+    if (command.args.includes("log")) return "1";
+    return "";
+  });
+  const report = await new CleanupRun(
+    [buildsTask("builds", root, policy)],
+    root,
+  ).run(context(host, "apply", []), () => {});
+  assert.deepEqual(
+    report.items.map((item) => [item.target, item.status]),
+    [
+      [first, "completed"],
+      [second, "skipped"],
+    ],
+  );
+  assert.match(report.items[1].detail, /Open files/);
+  assert.equal(await exists(first), false);
+  assert.equal(await readFile(join(second, "bundle.js"), "utf8"), "x");
 });
 
 test("a builds candidate that vanishes before du measures it is noted as absent, and the task lists the other candidates", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const gone = await oldProjectWithBuild(join(root, "a"));
-    const kept = await oldProjectWithBuild(join(root, "b"));
-    const local = new LocalHost(10_000);
-    const { host } = fake(async (command) => {
-      if (command.file === "du") {
-        if (command.args.at(-1) === gone) await rm(gone, { recursive: true });
-        return local.run(command, new AbortController().signal);
-      }
-      if (command.file !== "git") return undefined;
-      if (command.args.includes("rev-parse")) return command.args[1];
-      if (command.args.includes("log")) return "1";
-      return "";
-    });
-    const report = await new CleanupRun(
-      [buildsTask("builds", root, policy)],
-      root,
-    ).run(context(host, "preview", []), () => {});
-    assert.equal(report.tasks[0].error, null);
-    assert.deepEqual(
-      report.items.map((item) => [item.target, item.status]),
-      [[kept, "planned"]],
-    );
-    assert.ok(
-      report.tasks[0].notes.some((note) =>
-        note.includes(`Already absent: ${gone}`),
-      ),
-    );
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const gone = await oldProjectWithBuild(join(root, "a"));
+  const kept = await oldProjectWithBuild(join(root, "b"));
+  const local = new LocalHost(10_000);
+  const { host } = fake(async (command) => {
+    if (command.file === "du") {
+      if (command.args.at(-1) === gone) await rm(gone, { recursive: true });
+      return local.run(command, new AbortController().signal);
+    }
+    if (command.file !== "git") return undefined;
+    if (command.args.includes("rev-parse")) return command.args[1];
+    if (command.args.includes("log")) return "1";
+    return "";
+  });
+  const report = await new CleanupRun(
+    [buildsTask("builds", root, policy)],
+    root,
+  ).run(context(host, "preview", []), () => {});
+  assert.equal(report.tasks[0].error, null);
+  assert.deepEqual(
+    report.items.map((item) => [item.target, item.status]),
+    [[kept, "planned"]],
+  );
+  assert.ok(
+    report.tasks[0].notes.some((note) =>
+      note.includes(`Already absent: ${gone}`),
+    ),
+  );
 });
 
 test("a target removed by another process between discovery and apply is skipped as already absent, not failed", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const path = join(root, "archive.vsix");
-    await writeFile(path, "x");
-    await old(path);
-    // Only the action's own check reads the open files here: the target goes while lsof runs.
-    const { host } = fake(async (command) => {
-      if (command.file !== "lsof") return undefined;
-      await rm(path, { force: true });
-      return "";
-    });
-    const report = await new CleanupRun(
-      [
-        new SelectedPathsCleanup(
-          routine,
-          [{ path, select: "self", olderThanDays: 1, reason: "fixture" }],
-          policy,
-        ),
-      ],
-      root,
-    ).run(context(host, "apply", []), () => {});
-    assert.deepEqual(
-      report.items.map((item) => [item.target, item.status]),
-      [[path, "skipped"]],
-    );
-    assert.match(report.items[0].detail, /Already absent/);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const path = join(root, "archive.vsix");
+  await writeFile(path, "x");
+  await old(path);
+  // Only the action's own check reads the open files here: the target goes while lsof runs.
+  const { host } = fake(async (command) => {
+    if (command.file !== "lsof") return undefined;
+    await rm(path, { force: true });
+    return "";
+  });
+  const report = await new CleanupRun(
+    [
+      new SelectedPathsCleanup(
+        routine,
+        [{ path, select: "self", olderThanDays: 1, reason: "fixture" }],
+        policy,
+      ),
+    ],
+    root,
+  ).run(context(host, "apply", []), () => {});
+  assert.deepEqual(
+    report.items.map((item) => [item.target, item.status]),
+    [[path, "skipped"]],
+  );
+  assert.match(report.items[0].detail, /Already absent/);
 });
 
 test("recent sibling activity protects nested monorepo dependencies", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const project = join(root, "project");
-    const packagePath = join(project, "packages/a");
-    await mkdir(join(packagePath, "node_modules"), { recursive: true });
-    await mkdir(join(project, ".git"));
-    await writeFile(join(project, "package-lock.json"), "{}");
-    await mkdir(join(project, "packages/b"));
-    const recent = join(project, "packages/b/source.ts");
-    await writeFile(recent, "recent");
-    for (const path of [
-      project,
-      join(project, "packages"),
-      packagePath,
-      join(project, "packages/b"),
-      join(project, "package-lock.json"),
-    ])
-      await old(path);
-    const { host } = fake((command) => {
-      if (command.file !== "git") return undefined;
-      if (command.args.includes("rev-parse")) return project;
-      if (command.args.includes("reflog")) return "HEAD@{1}";
-      if (command.args.includes("log")) return "1";
-      return "";
-    });
-    const task = new ProjectArtifactsCleanup(
-      routine,
-      new MachineInventory({
-        home: root,
-        applicationDirs: [],
-        pathDirs: [],
-        env: {},
-      }),
-      "dependencies",
-      7,
-      policy,
-    );
-    const plan = await task.inspect(context(host, "preview", []));
-    assert.equal(plan.actions.length, 0);
-    assert.ok(
-      plan.notes.some((note) => note.includes("Recent project activity")),
-    );
-    assert.equal(await exists(join(packagePath, "node_modules")), true);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const project = join(root, "project");
+  const packagePath = join(project, "packages/a");
+  await mkdir(join(packagePath, "node_modules"), { recursive: true });
+  await mkdir(join(project, ".git"));
+  await writeFile(join(project, "package-lock.json"), "{}");
+  await mkdir(join(project, "packages/b"));
+  const recent = join(project, "packages/b/source.ts");
+  await writeFile(recent, "recent");
+  for (const path of [
+    project,
+    join(project, "packages"),
+    packagePath,
+    join(project, "packages/b"),
+    join(project, "package-lock.json"),
+  ])
+    await old(path);
+  const { host } = fake((command) => {
+    if (command.file !== "git") return undefined;
+    if (command.args.includes("rev-parse")) return project;
+    if (command.args.includes("reflog")) return "HEAD@{1}";
+    if (command.args.includes("log")) return "1";
+    return "";
+  });
+  const task = new ProjectArtifactsCleanup(
+    routine,
+    new MachineInventory({
+      home: root,
+      applicationDirs: [],
+      pathDirs: [],
+      env: {},
+    }),
+    "dependencies",
+    7,
+    policy,
+  );
+  const plan = await task.inspect(context(host, "preview", []));
+  assert.equal(plan.actions.length, 0);
+  assert.ok(
+    plan.notes.some((note) => note.includes("Recent project activity")),
+  );
+  assert.equal(await exists(join(packagePath, "node_modules")), true);
 });
 
 test("newer staged updates are retained while obsolete bundles are candidates", async () => {
-  const { root } = await fixture();
-  try {
-    const installed = join(root, "Applications/App.app");
-    const staging = join(
-      root,
-      "Caches/example.app/org.sparkle-project.Sparkle/Installation",
-    );
-    await mkdir(join(installed, "Contents/Frameworks/Sparkle.framework"), {
-      recursive: true,
-    });
-    await writeFile(join(installed, "Contents/Info.plist"), "");
-    await mkdir(join(staging, "Old.app"), { recursive: true });
-    await mkdir(join(staging, "New.app"));
-    const { host } = fake((command) =>
-      command.file === "plutil"
-        ? plist(
-            {
-              CFBundleIdentifier: "example.app",
-              CFBundleShortVersionString: command.args
-                .at(-1)!
-                .includes("New.app")
-                ? "3.0"
-                : command.args.at(-1)!.includes("Old.app")
-                  ? "1.0"
-                  : "2.0",
-              CFBundleVersion: "1",
-            },
-            command,
-          )
-        : undefined,
-    );
-    const task = new ObsoleteAppUpdatesCleanup(
-      routine,
-      new MachineInventory({
-        home: root,
-        applicationDirs: [join(root, "Applications")],
-        pathDirs: [],
-        env: {},
-      }),
-      join(root, "Caches"),
-      join(root, "Support"),
-    );
-    const plan = await task.inspect(context(host, "preview", []));
-    assert.equal(plan.actions.length, 1);
-    assert.equal(plan.actions[0].view.target, join(staging, "Old.app"));
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root } = scratch;
+  const installed = join(root, "Applications/App.app");
+  const staging = join(
+    root,
+    "Caches/example.app/org.sparkle-project.Sparkle/Installation",
+  );
+  await mkdir(join(installed, "Contents/Frameworks/Sparkle.framework"), {
+    recursive: true,
+  });
+  await writeFile(join(installed, "Contents/Info.plist"), "");
+  await mkdir(join(staging, "Old.app"), { recursive: true });
+  await mkdir(join(staging, "New.app"));
+  const { host } = fake((command) =>
+    command.file === "plutil"
+      ? plist(
+          {
+            CFBundleIdentifier: "example.app",
+            CFBundleShortVersionString: command.args.at(-1)!.includes("New.app")
+              ? "3.0"
+              : command.args.at(-1)!.includes("Old.app")
+                ? "1.0"
+                : "2.0",
+            CFBundleVersion: "1",
+          },
+          command,
+        )
+      : undefined,
+  );
+  const task = new ObsoleteAppUpdatesCleanup(
+    routine,
+    new MachineInventory({
+      home: root,
+      applicationDirs: [join(root, "Applications")],
+      pathDirs: [],
+      env: {},
+    }),
+    join(root, "Caches"),
+    join(root, "Support"),
+  );
+  const plan = await task.inspect(context(host, "preview", []));
+  assert.equal(plan.actions.length, 1);
+  assert.equal(plan.actions[0].view.target, join(staging, "Old.app"));
 });
 
 test("missing version metadata and a newer build of the same normalized version are retained", async () => {
-  const { root } = await fixture();
-  try {
-    const installed = join(root, "Applications/App.app"),
-      staging = join(
-        root,
-        "Caches/example.app/org.sparkle-project.Sparkle/Installation",
-      );
-    await mkdir(join(installed, "Contents/Frameworks/Sparkle.framework"), {
-      recursive: true,
-    });
-    await writeFile(join(installed, "Contents/Info.plist"), "");
-    await mkdir(join(staging, "NewBuild.app"), { recursive: true });
-    await mkdir(join(staging, "Unknown.app"));
-    const { host } = fake((command) => {
-      if (command.file !== "plutil") return undefined;
-      const path = command.args.at(-1)!;
-      if (path.includes("Unknown.app")) return plist({}, command);
-      return plist(
-        {
-          CFBundleIdentifier: "example.app",
-          CFBundleShortVersionString: path.includes("NewBuild.app")
-            ? "1.0.0"
-            : "1.0",
-          CFBundleVersion: path.includes("NewBuild.app") ? "2" : "1",
-        },
-        command,
-      );
-    });
-    const plan = await new ObsoleteAppUpdatesCleanup(
-      routine,
-      new MachineInventory({
-        home: root,
-        applicationDirs: [join(root, "Applications")],
-        pathDirs: [],
-        env: {},
-      }),
-      join(root, "Caches"),
-      join(root, "Support"),
-    ).inspect(context(host, "preview", []));
-    assert.equal(plan.actions.length, 0);
-    assert.equal(plan.notes.length, 2);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root } = scratch;
+  const installed = join(root, "Applications/App.app"),
+    staging = join(
+      root,
+      "Caches/example.app/org.sparkle-project.Sparkle/Installation",
+    );
+  await mkdir(join(installed, "Contents/Frameworks/Sparkle.framework"), {
+    recursive: true,
+  });
+  await writeFile(join(installed, "Contents/Info.plist"), "");
+  await mkdir(join(staging, "NewBuild.app"), { recursive: true });
+  await mkdir(join(staging, "Unknown.app"));
+  const { host } = fake((command) => {
+    if (command.file !== "plutil") return undefined;
+    const path = command.args.at(-1)!;
+    if (path.includes("Unknown.app")) return plist({}, command);
+    return plist(
+      {
+        CFBundleIdentifier: "example.app",
+        CFBundleShortVersionString: path.includes("NewBuild.app")
+          ? "1.0.0"
+          : "1.0",
+        CFBundleVersion: path.includes("NewBuild.app") ? "2" : "1",
+      },
+      command,
+    );
+  });
+  const plan = await new ObsoleteAppUpdatesCleanup(
+    routine,
+    new MachineInventory({
+      home: root,
+      applicationDirs: [join(root, "Applications")],
+      pathDirs: [],
+      env: {},
+    }),
+    join(root, "Caches"),
+    join(root, "Support"),
+  ).inspect(context(host, "preview", []));
+  assert.equal(plan.actions.length, 0);
+  assert.equal(plan.notes.length, 2);
 });
 
 test("Chrome clone identity and age are checked; installed app survives", async () => {
-  const { root, policy } = await fixture();
-  try {
-    const installed = join(root, "Applications/Google Chrome.app");
-    const clones = join(root, "clones");
-    const clone = join(clones, "code_sign_clone.old");
-    await mkdir(join(installed, "Contents"), { recursive: true });
-    await writeFile(join(installed, "Contents/Info.plist"), "");
-    await mkdir(join(clone, "Google Chrome.app.bundle"), { recursive: true });
-    await old(clone);
-    const { host } = fake((command) =>
-      command.file === "plutil"
-        ? plist(
-            {
-              CFBundleIdentifier: "com.google.Chrome",
-              CFBundleShortVersionString: "1",
-              CFBundleVersion: "100",
-            },
-            command,
-          )
-        : undefined,
-    );
-    const task = new ChromeClonesCleanup(
-      routine,
-      clones,
-      new MachineInventory({
-        home: root,
-        applicationDirs: [join(root, "Applications")],
-        pathDirs: [],
-        env: {},
-      }),
-      policy,
-    );
-    const plan = await task.inspect(context(host, "preview", []));
-    assert.equal(plan.actions.length, 1);
-    await plan.actions[0].execute(context(host, "apply", []), routine);
-    assert.equal(await exists(installed), true);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+  await using scratch = await fixture();
+  const { root, policy } = scratch;
+  const installed = join(root, "Applications/Google Chrome.app");
+  const clones = join(root, "clones");
+  const clone = join(clones, "code_sign_clone.old");
+  await mkdir(join(installed, "Contents"), { recursive: true });
+  await writeFile(join(installed, "Contents/Info.plist"), "");
+  await mkdir(join(clone, "Google Chrome.app.bundle"), { recursive: true });
+  await old(clone);
+  const { host } = fake((command) =>
+    command.file === "plutil"
+      ? plist(
+          {
+            CFBundleIdentifier: "com.google.Chrome",
+            CFBundleShortVersionString: "1",
+            CFBundleVersion: "100",
+          },
+          command,
+        )
+      : undefined,
+  );
+  const task = new ChromeClonesCleanup(
+    routine,
+    clones,
+    new MachineInventory({
+      home: root,
+      applicationDirs: [join(root, "Applications")],
+      pathDirs: [],
+      env: {},
+    }),
+    policy,
+  );
+  const plan = await task.inspect(context(host, "preview", []));
+  assert.equal(plan.actions.length, 1);
+  await plan.actions[0].execute(context(host, "apply", []), routine);
+  assert.equal(await exists(installed), true);
 });
 
 test("simulator deletion refuses to shut down a booted device", async () => {
