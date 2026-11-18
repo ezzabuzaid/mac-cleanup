@@ -1,17 +1,79 @@
-name: ci
+name: CI
+
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
-  pull_request:
+
+# A new push to a pull request replaces its run; every commit on main keeps
+# its own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ case(github.event_name == 'pull_request', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  # affected-range reads this workflow's runs to find the last green commit.
+  actions: read
+  contents: read
+
 jobs:
-  check:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the workspace
+        uses: JanuaryLabs/zukhruf/.github/actions/setup-workspace@main
+
+      - name: Find what changed
+        uses: JanuaryLabs/zukhruf/.github/actions/affected-range@main
+
+      # The checks of the whole tree run no Nx build task, so they run beside
+      # the affected targets.
+      - name: Check Nx workspace sync
+        background: true
+        run: npx nx sync:check
+
+      - name: Check formatting
+        background: true
+        run: npx prettier --check .
+
+      - name: Audit the workflows
+        background: true
+        uses: zizmorcore/zizmor-action@v0.8.1
+        with:
+          advanced-security: false
+          annotations: true
+
+      # The projects tagged platform:darwin run in the darwin job.
+      - name: Type check, test and build what changed
+        run: npx nx affected -t typecheck test build --exclude='tag:platform:darwin'
+
+      - name: Wait for the checks of the whole tree
+        wait-all:
+
+  # disk-cleanup drives launchd, a facility of macOS, so it runs all its targets
+  # on a macOS runner. The pattern selects every project and then takes the
+  # platform:darwin ones back out of the exclusion.
+  darwin:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          node-version-file: .nvmrc
-          cache: npm
-      - run: npm ci
-      - run: npx nx run disk-cleanup:typecheck
-      - run: npx nx run disk-cleanup:test
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up the workspace
+        uses: JanuaryLabs/zukhruf/.github/actions/setup-workspace@main
+
+      - name: Find what changed
+        uses: JanuaryLabs/zukhruf/.github/actions/affected-range@main
+
+      - name: Type check, test and build what changed
+        run: npx nx affected -t typecheck test build --exclude='*,!tag:platform:darwin'

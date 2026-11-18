@@ -1,0 +1,8 @@
+# zizmor (https://docs.zizmor.sh) audits the workflows in CI. Each entry here is
+# a choice, with its reason.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Tags and @main, not commit hashes, until actions are pinned (#4675).
+        "*": ref-pin

@@ -1,5 +1,6 @@
 {
   "name": "disk-cleanup",
+  "tags": ["platform:darwin"],
   "targets": {
     "typecheck": {
       "executor": "nx:run-commands",
@@ -17,7 +18,9 @@
     "test": {
       "dependsOn": ["build"],
       "executor": "nx:run-commands",
-      "options": { "command": "node --test dist/test/*.test.js" }
+      "options": {
+        "command": "node --test dist/test/*.test.js"
+      }
     }
   }
 }
